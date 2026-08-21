@@ -1,0 +1,16 @@
+.DS_Store
+.grok/references/
+.grok/skills/
+.grok/status
+.node_modules.lock
+.data/
+.output/
+.tanstack/
+.vercel/
+artifacts/
+node_modules/
+screenshots/harbor-fly-*
+*.log
+.env
+.env.*
+!.env.example

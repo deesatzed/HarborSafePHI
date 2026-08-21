@@ -1,0 +1,13 @@
+.DS_Store
+.git
+.gitignore
+.node_modules.lock
+.output
+.tanstack
+.vercel
+artifacts
+node_modules
+screenshots
+*.log
+.env
+.env.*
