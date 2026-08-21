@@ -1,5 +1,5 @@
-import { formatDateToken, indexDate } from "./dates";
-import { CATEGORY_TOKEN, type DateMode, type PhiSpan } from "./types";
+import { formatDateToken, indexDate } from "./dates.ts";
+import { CATEGORY_TOKEN, type DateMode, type PhiSpan } from "./types.ts";
 
 export type RedactionResult = {
   redacted: string;

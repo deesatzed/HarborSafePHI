@@ -1,18 +1,11 @@
-import type { CanonicalLabel, OpenMedSpan, TokenClassificationPipeline } from "openmed";
-import { mergeSpans } from "./merge";
-import type { DetectorSource, PhiCategory, PhiSpan } from "./types";
+import { normalizeLabel, type CanonicalLabel, type TokenClassificationPipeline, type TransformersRuntime } from "openmed";
+import { mergeSpans } from "./merge.ts";
+import type { DetectorSource, PhiCategory, PhiSpan } from "./types.ts";
 
 export const OPENMED_MODEL = "OpenMed/OpenMed-PII-ClinicalE5-Small-33M-v1-onnx-android";
+const CACHE_KEY = "transformers-cache";
 
 export type OpenMedDevice = "webgpu" | "wasm";
-
-export type OpenMedStatus = {
-  ready: boolean;
-  loading: boolean;
-  device: OpenMedDevice | null;
-  error: string | null;
-  progress: string;
-};
 
 type LoadedEngine = {
   pipeline: TokenClassificationPipeline;
@@ -74,6 +67,14 @@ const SKIP_LABELS = new Set<CanonicalLabel>([
   "ORDINAL_DIRECTION",
 ]);
 
+type HubProgress = {
+  status?: string;
+  file?: string;
+  progress?: number;
+  loaded?: number;
+  total?: number;
+};
+
 export function chunkText(text: string, size = 900, overlap = 80): { start: number; text: string }[] {
   if (text.length <= size) return [{ start: 0, text }];
   const chunks: { start: number; text: string }[] = [];
@@ -87,125 +88,244 @@ export function chunkText(text: string, size = 900, overlap = 80): { start: numb
   return chunks;
 }
 
-export function headerScanText(pages: { text: string }[], fullText: string): { start: number; text: string }[] {
-  if (pages.length === 0) return chunkText(fullText.slice(0, 4000));
-  const windows: { start: number; text: string }[] = [];
-  const seen = new Set<string>();
-  let cursor = 0;
-  for (const page of pages) {
-    const header = page.text.slice(0, 700);
-    const idx = fullText.indexOf(header.slice(0, 80), Math.max(0, cursor - 20));
-    const start = idx >= 0 ? idx : cursor;
-    const key = `${start}:${header.length}`;
-    if (!seen.has(key) && header.trim()) {
-      windows.push({ start, text: fullText.slice(start, start + Math.min(700, page.text.length)) });
-      seen.add(key);
-    }
-    cursor += page.text.length;
+export async function isOpenMedCached(): Promise<boolean> {
+  if (engine) return true;
+  if (typeof caches === "undefined") return false;
+  try {
+    const cache = await caches.open(CACHE_KEY);
+    const keys = await cache.keys();
+    return keys.some((request) => request.url.includes("OpenMed-PII-ClinicalE5-Small-33M"));
+  } catch {
+    return false;
   }
-  if (fullText.length > 0) {
-    windows.unshift({ start: 0, text: fullText.slice(0, Math.min(4000, fullText.length)) });
-  }
-  return windows;
 }
 
-export async function loadOpenMed(
-  onProgress?: (message: string) => void,
-): Promise<LoadedEngine> {
-  if (engine) return engine;
+async function configureHub(onProgress: (message: string) => void) {
+  const transformers = await import("@huggingface/transformers");
+  transformers.env.allowRemoteModels = true;
+  transformers.env.allowLocalModels = false;
+  transformers.env.useBrowserCache = true;
+  transformers.env.useWasmCache = true;
+  transformers.env.cacheKey = CACHE_KEY;
+  const progress = (info: HubProgress) => {
+    if (info.status === "progress" && typeof info.progress === "number") {
+      const file = info.file ? info.file.split("/").pop() : "model";
+      onProgress(`Downloading OpenMed ${file}… ${Math.round(info.progress)}%`);
+      return;
+    }
+    if (info.status === "progress_total" && typeof info.progress === "number") {
+      onProgress(`Downloading OpenMed… ${Math.round(info.progress)}%`);
+      return;
+    }
+    if (info.status === "initiate" && info.file) {
+      onProgress(`Preparing ${info.file.split("/").pop()}…`);
+    }
+    if (info.status === "done" && info.file) {
+      onProgress(`Cached ${info.file.split("/").pop()}.`);
+    }
+  };
+  return { transformers, progress };
+}
+
+export async function loadOpenMed(onProgress?: (message: string) => void): Promise<LoadedEngine> {
+  if (engine) {
+    onProgress?.(`OpenMed ready from cache (${engine.device}).`);
+    return engine;
+  }
   if (loading) return loading;
 
   loading = (async () => {
-    onProgress?.("Loading OpenMed runtime…");
+    const cached = await isOpenMedCached();
+    onProgress?.(cached ? "Loading OpenMed from this browser’s cache…" : "OpenMed is not cached yet. Downloading the on-device model…");
+    const { transformers, progress } = await configureHub(onProgress ?? (() => undefined));
     const openmed = await import("openmed");
-    const caps = openmed.detectOrtWebCapabilities();
+
     const tryLoad = async (device: OpenMedDevice, variant: "fp16" | "int8") => {
       onProgress?.(
         device === "webgpu"
-          ? "Downloading OpenMed PII model for WebGPU…"
-          : "Downloading OpenMed PII model for WASM…",
+          ? cached
+            ? "Starting OpenMed on WebGPU…"
+            : "Downloading the WebGPU OpenMed weights…"
+          : cached
+            ? "Starting OpenMed on WASM…"
+            : "Downloading the WASM OpenMed weights…",
       );
       const pipeline = await openmed.loadOnnxModel(OPENMED_MODEL, {
         variant,
         device: device === "webgpu" ? "webgpu" : "wasm",
+        dtype: variant === "fp16" ? "fp16" : "int8",
         allowRemoteModels: true,
+        localFilesOnly: false,
+        runtime: {
+          pipeline: ((task, model, options) =>
+            transformers.pipeline(task, model, options)) as TransformersRuntime["pipeline"],
+          env: transformers.env,
+        },
+        pipelineOptions: {
+          progress_callback: progress,
+          model_file_name: "model",
+          dtype: variant === "fp16" ? "fp16" : "int8",
+          subfolder: "",
+        },
       });
       return { pipeline, device };
     };
 
     try {
-      if (caps.webgpu) {
-        try {
-          engine = await tryLoad("webgpu", "fp16");
-          onProgress?.("OpenMed ready on WebGPU.");
-          return engine;
-        } catch {
-          onProgress?.("WebGPU unavailable, falling back to WASM…");
-        }
-      }
       engine = await tryLoad("wasm", "int8");
-      onProgress?.("OpenMed ready on WASM.");
+      onProgress?.("OpenMed ready on WASM. Weights stay in this browser.");
       return engine;
     } catch (error) {
       loading = null;
-      const message = error instanceof Error ? error.message : "OpenMed failed to load";
-      throw new Error(message);
+      throw new Error(error instanceof Error ? error.message : "OpenMed failed to load");
     }
   })();
 
   return loading;
 }
 
-function toPhiSpan(span: OpenMedSpan, text: string, offset: number, index: number): PhiSpan | null {
-  if (SKIP_LABELS.has(span.canonical_label)) return null;
-  if ((span.score ?? 1) < 0.35) return null;
-  const category = LABEL_TO_CATEGORY[span.canonical_label];
+function toPhiSpan(args: {
+  canonical: CanonicalLabel;
+  start: number;
+  end: number;
+  score: number | null;
+  text: string;
+  offset: number;
+  index: number;
+}): PhiSpan | null {
+  if (SKIP_LABELS.has(args.canonical)) return null;
+  if ((args.score ?? 1) < 0.35) return null;
+  const category = LABEL_TO_CATEGORY[args.canonical];
   if (!category) return null;
-  const start = span.start + offset;
-  const end = span.end + offset;
-  const surface = text.slice(start, end);
+  const start = args.start + args.offset;
+  const end = args.end + args.offset;
+  const surface = args.text.slice(start, end);
   if (!surface.trim()) return null;
   if (category === "age") {
     const n = Number.parseInt(surface.replace(/[^\d]/g, ""), 10);
     if (!Number.isNaN(n) && n < 90) return null;
   }
   return {
-    id: `om-${offset}-${index}`,
+    id: `om-${args.offset}-${args.index}`,
     start,
     end,
     text: surface,
     category,
     source: "openmed" as DetectorSource,
-    confidence: span.score ?? 0.7,
+    confidence: args.score ?? 0.7,
     accepted: true,
-    label: span.canonical_label,
+    label: args.canonical,
   };
+}
+
+type PipelineEntity = {
+  entity?: string;
+  entity_group?: string;
+  word?: string;
+  score?: number;
+  start?: number;
+  end?: number;
+};
+
+const EXTRA_LABELS: Record<string, CanonicalLabel> = {
+  companyname: "ORGANIZATION",
+  hospital: "ORGANIZATION",
+  facility: "ORGANIZATION",
+  patientname: "PERSON",
+  provider: "PERSON",
+  physician: "PERSON",
+  doctor: "PERSON",
+};
+
+function canonicalFromGroup(label: string): CanonicalLabel {
+  const cleaned = label.replace(/^[BIES]-/i, "");
+  const canonical = normalizeLabel(cleaned);
+  if (canonical !== "OTHER") return canonical;
+  const key = cleaned.toLowerCase().replace(/[^a-z0-9]/g, "");
+  return EXTRA_LABELS[key] ?? "OTHER";
+}
+
+function locateSurface(haystack: string, word: string, from: number): { start: number; end: number } | null {
+  const needle = word.replace(/\s+/g, " ").trim();
+  if (needle.length < 2) return null;
+  const idx = haystack.toLowerCase().indexOf(needle.toLowerCase(), from);
+  if (idx < 0) return null;
+  return { start: idx, end: idx + needle.length };
+}
+
+function flattenPipelineOutput(output: unknown): PipelineEntity[] {
+  if (Array.isArray(output)) {
+    if (output.length === 0) return [];
+    if (Array.isArray(output[0])) return (output as PipelineEntity[][]).flat();
+    return output as PipelineEntity[];
+  }
+  if (output && typeof output === "object") {
+    const record = output as { entities?: PipelineEntity[] };
+    if (Array.isArray(record.entities)) return record.entities;
+  }
+  return [];
+}
+
+function describePipelineOutput(output: unknown): string {
+  if (output == null) return "null";
+  if (Array.isArray(output)) {
+    const first = output[0] as { entity?: string; entity_group?: string; start?: number } | undefined;
+    return `array(${output.length}) first=${first ? JSON.stringify(first).slice(0, 180) : "empty"}`;
+  }
+  if (typeof output === "object") return `object keys=${Object.keys(output as object).join(",")}`;
+  return typeof output;
 }
 
 export async function scanWithOpenMed(args: {
   text: string;
-  windows: { start: number; text: string }[];
+  windows?: { start: number; text: string }[];
   onProgress?: (message: string) => void;
-}): Promise<{ spans: PhiSpan[]; device: OpenMedDevice }> {
+}): Promise<{ spans: PhiSpan[]; device: OpenMedDevice; debug: string }> {
   const loaded = await loadOpenMed(args.onProgress);
-  const openmed = await import("openmed");
+  const windows = args.windows ?? chunkText(args.text);
   const found: PhiSpan[] = [];
+  let rawCount = 0;
+  let debug = "";
   let i = 0;
-  for (const window of args.windows) {
+  for (const window of windows) {
     i += 1;
-    args.onProgress?.(`OpenMed scanning window ${i} of ${args.windows.length}…`);
-    const raw = await openmed.extractPii(window.text, {
-      pipeline: loaded.pipeline,
-      threshold: 0.35,
-      detector: "openmed",
-      hashSecret: "harbor-local",
+    args.onProgress?.(`OpenMed reading window ${i} of ${windows.length}…`);
+    const output = await loaded.pipeline(window.text, {
+      aggregation_strategy: "simple",
+      ignore_labels: ["O"],
     });
-    raw.forEach((span, index) => {
-      const mapped = toPhiSpan(span, args.text, window.start, found.length + index);
+    const entities = flattenPipelineOutput(output);
+    rawCount += entities.length;
+    if (entities.length === 0 && i === 1) {
+      const raw = await loaded.pipeline(window.text.slice(0, 240), { ignore_labels: [] });
+      debug = describePipelineOutput(raw);
+    }
+    let cursor = 0;
+    entities.forEach((entity, index) => {
+      let start = Number(entity.start);
+      let end = Number(entity.end);
+      if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) {
+        const located = locateSurface(window.text, entity.word ?? "", cursor);
+        if (!located) return;
+        start = located.start;
+        end = located.end;
+        cursor = located.end;
+      } else {
+        cursor = Math.max(cursor, end);
+      }
+      const mapped = toPhiSpan({
+        canonical: canonicalFromGroup(entity.entity_group ?? entity.entity ?? ""),
+        start,
+        end,
+        score: entity.score ?? null,
+        text: args.text,
+        offset: window.start,
+        index: found.length + index,
+      });
       if (mapped) found.push(mapped);
     });
   }
-  return { spans: mergeSpans(args.text, found), device: loaded.device };
+  return { spans: mergeSpans(args.text, found), device: loaded.device, debug: `raw entities ${rawCount}` };
 }
 
 export function webGpuAvailable(): boolean {

@@ -14,3 +14,12 @@ screenshots/harbor-fly-*
 .env
 .env.*
 !.env.example
+
+# Real charts, summaries, and Word exports — never commit
+*deidentified*
+*clinical-summary*
+OEportable*
+WS2My*
+V3fSummary*
+V5Summary*
+*.docx

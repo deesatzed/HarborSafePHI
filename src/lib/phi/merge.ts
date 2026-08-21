@@ -1,11 +1,12 @@
-import { isFrozenClinicalTerm } from "./freeze";
-import { SAFE_HARBOR_DEFAULT_ON, type PhiSpan } from "./types";
+import { isFrozenClinicalTerm } from "./freeze.ts";
+import { SAFE_HARBOR_DEFAULT_ON, type PhiSpan } from "./types.ts";
 
 const SOURCE_RANK: Record<PhiSpan["source"], number> = {
-  seed: 4,
-  label: 3,
-  regex: 2,
-  openmed: 1,
+  manual: 5,
+  openmed: 4,
+  seed: 3,
+  label: 2,
+  regex: 1,
 };
 
 function overlaps(a: PhiSpan, b: PhiSpan): boolean {
@@ -43,7 +44,10 @@ export function mergeSpans(text: string, incoming: PhiSpan[]): PhiSpan[] {
       ...span,
       id: span.id || `span-${index}`,
       text: text.slice(span.start, span.end),
-      accepted: SAFE_HARBOR_DEFAULT_ON.has(span.category),
+      accepted:
+        span.source === "manual" || span.source === "openmed"
+          ? span.accepted
+          : SAFE_HARBOR_DEFAULT_ON.has(span.category) && span.accepted,
     }))
     .sort((a, b) => a.start - b.start);
 }

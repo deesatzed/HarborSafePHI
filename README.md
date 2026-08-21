@@ -13,6 +13,8 @@ Do not commit PHI, API keys, credentials, raw charts, or private exports to this
 
 ## Development
 
+Copy `.env.example` to `.env` and set `OPENROUTER_API_KEY` plus one or more `OPENROUTER_MODEL_n` ids. The key stays on the server. The PDF never leaves the browser.
+
 ```bash
 npm ci
 npm run dev

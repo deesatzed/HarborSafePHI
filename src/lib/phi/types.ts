@@ -21,7 +21,7 @@ export type PhiCategory =
   | "org"
   | "other_id";
 
-export type DetectorSource = "seed" | "label" | "regex" | "openmed";
+export type DetectorSource = "seed" | "label" | "regex" | "openmed" | "manual";
 
 export type DateMode = "relative" | "year" | "keep";
 
@@ -59,12 +59,27 @@ export const EMPTY_SEED: IdentitySeed = {
   zip: "",
 };
 
+export type ExtractorId = "layout" | "haseol" | "naive" | "legacy";
+
+export type ExtractorSnapshot = {
+  id: ExtractorId;
+  label: string;
+  hint: string;
+  text: string;
+  chars: number;
+  lines: number;
+  camelGlue: number;
+  letterDigitGlue: number;
+};
+
 export type ExtractedPdf = {
   fileName: string;
   pageCount: number;
   text: string;
   pages: { pageNumber: number; text: string }[];
   hasTextLayer: boolean;
+  extractor?: ExtractorId;
+  extractors?: ExtractorSnapshot[];
 };
 
 export const CATEGORY_TOKEN: Record<PhiCategory, string> = {
@@ -114,6 +129,23 @@ export const CATEGORY_LABEL: Record<PhiCategory, string> = {
   org: "Organization",
   other_id: "Other ID",
 };
+
+export const REDACT_MENU_CATEGORIES: PhiCategory[] = [
+  "name",
+  "dob",
+  "date",
+  "phone",
+  "email",
+  "ssn",
+  "mrn",
+  "address",
+  "zip",
+  "account",
+  "npi",
+  "accession",
+  "org",
+  "other_id",
+];
 
 export const SAFE_HARBOR_DEFAULT_ON: ReadonlySet<PhiCategory> = new Set([
   "name",

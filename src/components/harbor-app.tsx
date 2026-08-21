@@ -1,93 +1,156 @@
-import { useMemo, useRef, useState } from "react";
-import {
-  AlertTriangle,
-  Check,
-  Copy,
-  Cpu,
-  Download,
-  FileUp,
-  Loader2,
-  Shield,
-  Trash2,
-} from "lucide-react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { AlertTriangle, Check, Cpu, FileUp, Loader2, Shield, Trash2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
-import { detectLocalPhi, mergeDetectorPasses } from "@/lib/phi/detect";
+import {
+  DateModePicker,
+  ExtractorCompare,
+  FindingsList,
+  ModeToggle,
+  ReportPanel,
+  SeedForm,
+} from "@/components/harbor-panels";
+import { RedactDoc } from "@/components/redact-doc";
+import { detectLocalPhi, supplementWithLocalPhi } from "@/lib/phi/detect";
 import { buildExport, downloadTextFile } from "@/lib/phi/export";
 import { buildSamplePdf, extractPdfText } from "@/lib/phi/extract-pdf";
-import { headerScanText, scanWithOpenMed, chunkText } from "@/lib/phi/openmed";
-import { redactText, segmentText } from "@/lib/phi/redact";
+import { prepareModelInput } from "@/lib/phi/packet";
+import { formatExtractorCompare } from "@/lib/phi/pdf-text";
+import { isOpenMedCached, scanWithOpenMed } from "@/lib/phi/openmed";
+import { redactText } from "@/lib/phi/redact";
 import { SAMPLE_CHART, SAMPLE_FILE_NAME } from "@/lib/phi/sample-chart";
+import { EMPTY_SEED, type DateMode, type ExtractedPdf, type IdentitySeed, type PhiSpan } from "@/lib/phi/types";
 import {
-  CATEGORY_LABEL,
-  EMPTY_SEED,
-  type DateMode,
-  type ExtractedPdf,
-  type IdentitySeed,
-  type PhiSpan,
-} from "@/lib/phi/types";
-import {
-  OPENROUTER_MODELS,
+  fetchOpenRouterModels,
   readOpenRouterKey,
   readOpenRouterModel,
   summarizeWithOpenRouter,
   writeOpenRouterKey,
   writeOpenRouterModel,
+  type OpenRouterModel,
 } from "@/lib/openrouter";
+import type { ReportConfig } from "@/lib/openrouter-env";
+import { generateServerReport, getReportConfig } from "@/lib/report";
 import { cn } from "@/lib/utils";
 
 type Stage = "idle" | "working" | "review";
-type ReviewTab = "clean" | "original" | "findings";
+type HarborMode = "simple" | "complex";
 
-const DATE_MODES: { id: DateMode; label: string; hint: string }[] = [
-  { id: "relative", label: "Relative", hint: "Day 0, Day +N — best for AI" },
-  { id: "year", label: "Year only", hint: "Safe Harbor" },
-  { id: "keep", label: "Keep dates", hint: "Do not send off-device" },
-];
+function readMode(): HarborMode {
+  if (typeof window === "undefined") return "simple";
+  return localStorage.getItem("harbor.mode") === "complex" ? "complex" : "simple";
+}
 
 export function HarborApp() {
   const inputRef = useRef<HTMLInputElement>(null);
+  const [mode, setMode] = useState<HarborMode>(readMode);
   const [stage, setStage] = useState<Stage>("idle");
   const [status, setStatus] = useState("Reading PDF…");
   const [error, setError] = useState<string | null>(null);
-  const [seed, setSeed] = useState<IdentitySeed>(EMPTY_SEED);
   const [extracted, setExtracted] = useState<ExtractedPdf | null>(null);
   const [spans, setSpans] = useState<PhiSpan[]>([]);
-  const [dateMode, setDateMode] = useState<DateMode>("relative");
-  const [tab, setTab] = useState<ReviewTab>("clean");
-  const [detectors, setDetectors] = useState<string[]>(["regex", "labels"]);
-  const [openmedBusy, setOpenmedBusy] = useState(false);
-  const [openmedNote, setOpenmedNote] = useState(
-    "OpenMed can run on this device after a one-time model download.",
-  );
-  const [openmedDevice, setOpenmedDevice] = useState<string | null>(null);
+  const [openMedSpans, setOpenMedSpans] = useState<PhiSpan[]>([]);
+  const [detectors, setDetectors] = useState<string[]>([]);
+  const [openmedNote, setOpenmedNote] = useState("");
   const [dragging, setDragging] = useState(false);
-  const [showSeed, setShowSeed] = useState(false);
-  const [apiKey, setApiKey] = useState(() => (typeof window === "undefined" ? "" : readOpenRouterKey()));
-  const [model, setModel] = useState(() => (typeof window === "undefined" ? OPENROUTER_MODELS[0].id : readOpenRouterModel()));
-  const [showSend, setShowSend] = useState(false);
-  const [summary, setSummary] = useState<string | null>(null);
-  const [summaryBusy, setSummaryBusy] = useState(false);
   const [copied, setCopied] = useState<string | null>(null);
+  const [docView, setDocView] = useState<"redacted" | "original">("redacted");
+  const [seed, setSeed] = useState<IdentitySeed>(EMPTY_SEED);
+  const [dateMode, setDateMode] = useState<DateMode>("relative");
+  const [config, setConfig] = useState<ReportConfig | null>(null);
+  const [report, setReport] = useState<string | null>(null);
+  const [reportBusy, setReportBusy] = useState(false);
+  const [reportError, setReportError] = useState<string | null>(null);
+  const [apiKey, setApiKey] = useState(() => (typeof window === "undefined" ? "" : readOpenRouterKey()));
+  const [model, setModel] = useState(() => (typeof window === "undefined" ? "" : readOpenRouterModel()));
+  const [catalog, setCatalog] = useState<OpenRouterModel[]>([]);
+  const [catalogBusy, setCatalogBusy] = useState(false);
+  const [catalogError, setCatalogError] = useState<string | null>(null);
+  const autoReportFor = useRef<string | null>(null);
 
-  const redaction = useMemo(() => {
-    if (!extracted) return null;
-    return redactText(extracted.text, spans, dateMode);
-  }, [extracted, spans, dateMode]);
-
+  const redacted = extracted ? redactText(extracted.text, spans, dateMode).redacted : "";
   const accepted = spans.filter((span) => span.accepted).length;
+  const showKeyFields = mode === "complex" && !config?.configured;
 
-  async function ingest(extractedDoc: ExtractedPdf, extraDetectors: string[] = []) {
+  useEffect(() => {
+    let cancelled = false;
+    void getReportConfig().then((value) => {
+      if (cancelled) return;
+      setConfig(value);
+      if (value.configured && value.model) {
+        setModel((current) => (value.models.includes(current) ? current : value.model as string));
+      }
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!showKeyFields) return;
+    let cancelled = false;
+    setCatalogBusy(true);
+    setCatalogError(null);
+    void fetchOpenRouterModels()
+      .then((models) => {
+        if (!cancelled) setCatalog(models);
+      })
+      .catch((err: unknown) => {
+        if (!cancelled) setCatalogError(err instanceof Error ? err.message : "Could not load models.");
+      })
+      .finally(() => {
+        if (!cancelled) setCatalogBusy(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [showKeyFields]);
+
+  const reportFingerprint = useMemo(() => `${dateMode}:${redacted.length}:${accepted}`, [dateMode, redacted, accepted]);
+
+  async function runPipeline(extractedDoc: ExtractedPdf) {
     setExtracted(extractedDoc);
-    const local = detectLocalPhi(extractedDoc.text, seed);
-    setSpans(local);
-    setDetectors(["regex", "labels", ...extraDetectors, ...(seed.fullName || seed.mrn ? ["known identity"] : [])]);
+    setCopied(null);
+    setDocView("redacted");
+    setReport(null);
+    setReportError(null);
+    autoReportFor.current = null;
+    const cached = await isOpenMedCached();
+    setStatus(cached ? "Loading cached OpenMed…" : "Downloading OpenMed into this browser…");
+    let nextOpenMed: PhiSpan[] = [];
+    let used = ["regex", "labels"];
+    try {
+      const result = await scanWithOpenMed({
+        text: extractedDoc.text,
+        onProgress: (message) => {
+          setStatus(message);
+          setOpenmedNote(message);
+        },
+      });
+      nextOpenMed = result.spans;
+      used = ["openmed", "regex", "labels"];
+      setOpenmedNote(
+        `OpenMed (${result.device}) marked ${result.spans.length} spans, then local rules filled gaps.`,
+      );
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "OpenMed failed to load.";
+      setOpenmedNote(message);
+      setError(`OpenMed did not finish: ${message} Local rules still ran.`);
+    }
+    const merged =
+      nextOpenMed.length > 0
+        ? supplementWithLocalPhi(extractedDoc.text, nextOpenMed, seed)
+        : detectLocalPhi(extractedDoc.text, seed);
+    setOpenMedSpans(nextOpenMed);
+    setSpans(merged);
+    setDetectors(used);
     setStage("review");
-    setTab("clean");
-    setSummary(null);
     if (!extractedDoc.hasTextLayer) {
-      setError("This PDF has no selectable text. Harbor cannot OCR scans yet — download a text PDF from MyChart, not a photograph.");
-    } else {
+      setError("This PDF has no selectable text. Harbor cannot OCR scans yet — use a text PDF from MyChart, not a photograph.");
+    } else if (nextOpenMed.length > 0) {
       setError(null);
+    }
+    if (mode === "simple") {
+      void createReport(true, extractedDoc, merged);
     }
   }
 
@@ -97,8 +160,7 @@ export function HarborApp() {
     setStatus("Reading PDF in this browser…");
     try {
       const extractedDoc = await extractPdfText(file);
-      setStatus("Running local Safe Harbor detectors…");
-      await ingest(extractedDoc);
+      await runPipeline(extractedDoc);
     } catch (err) {
       setStage("idle");
       setError(err instanceof Error ? err.message : "Could not read that PDF.");
@@ -113,7 +175,7 @@ export function HarborApp() {
       const file = await buildSamplePdf();
       await onFile(file);
     } catch {
-      const extractedDoc: ExtractedPdf = {
+      await runPipeline({
         fileName: SAMPLE_FILE_NAME,
         pageCount: 2,
         text: SAMPLE_CHART,
@@ -122,32 +184,8 @@ export function HarborApp() {
           { pageNumber: 2, text: SAMPLE_CHART },
         ],
         hasTextLayer: true,
-      };
-      await ingest(extractedDoc);
-    }
-  }
-
-  async function runOpenMed(deep: boolean) {
-    if (!extracted) return;
-    setOpenmedBusy(true);
-    setError(null);
-    try {
-      const windows = deep ? chunkText(extracted.text) : headerScanText(extracted.pages, extracted.text);
-      const result = await scanWithOpenMed({
-        text: extracted.text,
-        windows,
-        onProgress: setOpenmedNote,
+        extractor: "layout",
       });
-      setSpans((current) => mergeDetectorPasses(extracted.text, [current, result.spans]));
-      setDetectors((current) => (current.includes("openmed") ? current : [...current, "openmed"]));
-      setOpenmedDevice(result.device);
-      setOpenmedNote(
-        `OpenMed (${result.device}) found ${result.spans.length} additional spans.`,
-      );
-    } catch (err) {
-      setOpenmedNote(err instanceof Error ? err.message : "OpenMed failed to start.");
-    } finally {
-      setOpenmedBusy(false);
     }
   }
 
@@ -155,47 +193,88 @@ export function HarborApp() {
     setStage("idle");
     setExtracted(null);
     setSpans([]);
-    setSummary(null);
+    setOpenMedSpans([]);
     setError(null);
-    setShowSend(false);
+    setOpenmedNote("");
+    setReport(null);
+    setReportError(null);
+    setCopied(null);
+    autoReportFor.current = null;
   }
 
   function exportFiles() {
     if (!extracted) return;
-    const payload = buildExport({ extracted, spans, dateMode, detectors });
+    const payload = buildExport({ extracted, spans, dateMode, detectors, report });
     const base = extracted.fileName.replace(/\.pdf$/i, "") + "-deidentified";
     downloadTextFile(`${base}.md`, payload.markdown, "text/markdown");
     downloadTextFile(`${base}.json`, JSON.stringify(payload.json, null, 2), "application/json");
   }
 
-  async function copy(label: string, value: string) {
+  function downloadExtractorCompare() {
+    if (!extracted?.extractors?.length) return;
+    const base = extracted.fileName.replace(/\.pdf$/i, "") + "-extractors";
+    downloadTextFile(`${base}.txt`, formatExtractorCompare(extracted.extractors), "text/plain");
+  }
+
+  async function copy(label: "report" | "clean", value: string) {
     await navigator.clipboard.writeText(value);
     setCopied(label);
     window.setTimeout(() => setCopied(null), 1400);
   }
 
-  async function sendToOpenRouter() {
-    if (!redaction) return;
-    if (dateMode === "keep") {
-      setError("Date mode is “Keep dates.” Switch to Relative or Year before sending anything off-device.");
-      return;
-    }
-    writeOpenRouterKey(apiKey);
-    writeOpenRouterModel(model);
-    setSummaryBusy(true);
-    setError(null);
+  async function createReport(
+    automatic = false,
+    doc = extracted,
+    nextSpans = spans,
+  ) {
+    if (!doc) return;
+    if (automatic && autoReportFor.current === reportFingerprint) return;
+    const text = prepareModelInput(redactText(doc.text, nextSpans, "keep").redacted);
+    setReportBusy(true);
+    setReportError(null);
     try {
-      const text = await summarizeWithOpenRouter({
+      const serverResult = await generateServerReport({
+        data: {
+          redactedText: text,
+          model: config?.configured
+            ? config.models.includes(model)
+              ? model
+              : (config.model ?? "")
+            : "",
+        },
+      });
+      if (serverResult.ok) {
+        setReport(serverResult.text);
+        autoReportFor.current = reportFingerprint;
+        return;
+      }
+      const missingSecrets = /OPENROUTER_API_KEY and OPENROUTER_MODEL/.test(serverResult.error);
+      if (automatic && missingSecrets) return;
+      if (!missingSecrets) throw new Error(serverResult.error);
+      if (!apiKey.trim() || !model.trim()) {
+        throw new Error(
+          "Set OPENROUTER_API_KEY and OPENROUTER_MODEL on the server (including Fly secrets), or paste a key and model in Complex.",
+        );
+      }
+      writeOpenRouterKey(apiKey);
+      writeOpenRouterModel(model);
+      const textOut = await summarizeWithOpenRouter({
         apiKey,
         model,
-        redactedText: redaction.redacted,
+        redactedText: text,
       });
-      setSummary(text);
+      setReport(textOut);
+      autoReportFor.current = reportFingerprint;
     } catch (err) {
-      setError(err instanceof Error ? err.message : "OpenRouter request failed.");
+      setReportError(err instanceof Error ? err.message : "Report failed.");
     } finally {
-      setSummaryBusy(false);
+      setReportBusy(false);
     }
+  }
+
+  function changeMode(next: HarborMode) {
+    setMode(next);
+    localStorage.setItem("harbor.mode", next);
   }
 
   return (
@@ -208,19 +287,55 @@ export function HarborApp() {
               De-identify a chart before any AI sees it.
             </h1>
             <p className="mt-3 max-w-prose text-sm leading-relaxed text-muted sm:text-base">
-              Drop a MyChart / Epic PDF. Detection runs in this tab with local rules and optional OpenMed on WebGPU.
-              OpenRouter only receives text you review and approve.
+              {mode === "simple"
+                ? "Drop a PDF, fix the highlights, and Harbor writes the report. Download it or copy it."
+                : "Full controls: known identity, date handling, findings, and OpenRouter when no server secret is set."}
             </p>
           </div>
-          {stage === "review" ? (
-            <Button variant="secondary" onClick={reset}>
-              <Trash2 className="size-4" />
-              Start over
-            </Button>
-          ) : null}
+          <div className="flex w-full max-w-xs flex-col gap-2 sm:w-56">
+            <ModeToggle mode={mode} onChange={changeMode} />
+            {stage === "review" ? (
+              <Button variant="secondary" onClick={reset}>
+                <Trash2 className="size-4" />
+                Start over
+              </Button>
+            ) : null}
+          </div>
         </header>
 
-        <TrustStrip />
+        {mode === "simple" ? (
+          <ul className="grid gap-3 sm:grid-cols-3">
+            {[
+              { icon: Shield, title: "1. Add a file", body: "PDF stays in this tab." },
+              { icon: Cpu, title: "2. Check highlights", body: "OpenMed first, then you edit." },
+              { icon: Check, title: "3. Report", body: "Download or copy when it lands." },
+            ].map((item) => (
+              <li key={item.title} className="flex gap-3 rounded-lg border border-line bg-paper px-4 py-3">
+                <item.icon className="mt-0.5 size-4 shrink-0 text-accent" />
+                <div>
+                  <p className="text-sm font-medium">{item.title}</p>
+                  <p className="text-xs leading-relaxed text-muted">{item.body}</p>
+                </div>
+              </li>
+            ))}
+          </ul>
+        ) : (
+          <ul className="grid gap-3 sm:grid-cols-3">
+            {[
+              { icon: Shield, title: "PDF stays here", body: "Read with pdf.js in this tab." },
+              { icon: Cpu, title: "OpenMed first", body: "Cached on this device after one download." },
+              { icon: Check, title: "You control send", body: "Server secret or a key you paste." },
+            ].map((item) => (
+              <li key={item.title} className="flex gap-3 rounded-lg border border-line bg-paper px-4 py-3">
+                <item.icon className="mt-0.5 size-4 shrink-0 text-accent" />
+                <div>
+                  <p className="text-sm font-medium">{item.title}</p>
+                  <p className="text-xs leading-relaxed text-muted">{item.body}</p>
+                </div>
+              </li>
+            ))}
+          </ul>
+        )}
 
         {error ? (
           <div className="flex gap-3 rounded-lg border border-phi/30 bg-phi-soft px-4 py-3 text-sm text-phi">
@@ -230,7 +345,7 @@ export function HarborApp() {
         ) : null}
 
         {stage !== "review" ? (
-          <section className="grid gap-4 lg:grid-cols-[minmax(0,1fr)_20rem]">
+          <section className="grid gap-4 lg:grid-cols-[minmax(0,1fr)_18rem]">
             <button
               type="button"
               onClick={() => inputRef.current?.click()}
@@ -254,8 +369,12 @@ export function HarborApp() {
               {stage === "working" ? (
                 <>
                   <Loader2 className="size-8 animate-spin text-accent" />
-                  <p className="font-medium">{status}</p>
-                  <p className="text-sm text-muted">The file is not uploaded.</p>
+                  <p className="font-medium" data-testid="status">
+                    {status}
+                  </p>
+                  <p className="max-w-sm text-sm text-muted">
+                    The chart never leaves this device. The OpenMed download is cached after the first time.
+                  </p>
                 </>
               ) : (
                 <>
@@ -263,9 +382,7 @@ export function HarborApp() {
                     <FileUp className="size-6" />
                   </span>
                   <p className="font-medium">Drop a MyChart PDF here</p>
-                  <p className="max-w-sm text-sm text-muted">
-                    Or click to choose a file. Nothing leaves this device until you send a reviewed, redacted payload.
-                  </p>
+                  <p className="max-w-sm text-sm text-muted">OpenMed starts as soon as the file is in this tab.</p>
                 </>
               )}
             </button>
@@ -280,377 +397,129 @@ export function HarborApp() {
                 event.target.value = "";
               }}
             />
-
-            <aside className="flex flex-col gap-3 rounded-xl border border-line bg-paper p-5 shadow-soft">
-              <h2 className="font-serif text-lg font-medium">Known identity</h2>
-              <p className="text-sm leading-relaxed text-muted">
-                Optional, and the most precise layer. Add the patient’s name, MRN, and DOB so Harbor can exact-match
-                headers that repeat on every page.
-              </p>
-              <Button variant="secondary" onClick={() => setShowSeed((value) => !value)}>
-                {showSeed ? "Hide fields" : "Add known identifiers"}
-              </Button>
-              {showSeed ? <SeedForm seed={seed} onChange={setSeed} /> : null}
-              <div className="mt-auto flex flex-col gap-2 pt-2">
-                <Button variant="primary" onClick={() => void onSample()} disabled={stage === "working"}>
-                  Try a synthetic sample chart
-                </Button>
-                <p className="text-xs leading-relaxed text-subtle">
-                  The sample is fake. Do not paste a real record into this chat — drop it only in this page.
+            <aside className="flex flex-col justify-between gap-3 rounded-xl border border-line bg-paper p-5 shadow-soft">
+              <div>
+                <h2 className="font-serif text-lg font-medium">No chart handy?</h2>
+                <p className="mt-2 text-sm leading-relaxed text-muted">
+                  The sample is synthetic. Use it to confirm the flow, then drop a real text PDF from MyChart.
                 </p>
               </div>
+              <Button
+                variant="primary"
+                data-testid="try-sample"
+                onClick={() => void onSample()}
+                disabled={stage === "working"}
+              >
+                Try a synthetic sample
+              </Button>
             </aside>
           </section>
-        ) : extracted && redaction ? (
-          <Review
-            extracted={extracted}
-            spans={spans}
-            setSpans={setSpans}
-            dateMode={dateMode}
-            setDateMode={setDateMode}
-            tab={tab}
-            setTab={setTab}
-            accepted={accepted}
-            redacted={redaction.redacted}
-            detectors={detectors}
-            openmedBusy={openmedBusy}
-            openmedNote={openmedNote}
-            openmedDevice={openmedDevice}
-            onOpenMed={runOpenMed}
-            onExport={exportFiles}
-            onCopy={(value) => void copy("clean", value)}
-            copied={copied === "clean"}
-            showSend={showSend}
-            setShowSend={setShowSend}
-            apiKey={apiKey}
-            setApiKey={setApiKey}
-            model={model}
-            setModel={setModel}
-            summary={summary}
-            summaryBusy={summaryBusy}
-            onSend={() => void sendToOpenRouter()}
-            seed={seed}
-            setSeed={setSeed}
-            onRescan={() => {
-              if (!extracted) return;
-              setSpans(detectLocalPhi(extracted.text, seed));
-            }}
-          />
+        ) : extracted ? (
+          <section className="grid gap-4 lg:grid-cols-[18rem_minmax(0,1fr)]">
+            <aside className="flex min-w-0 flex-col gap-4 overflow-x-hidden rounded-xl border border-line bg-paper p-4 shadow-soft lg:p-5">
+              <div>
+                <p className="text-xs font-medium uppercase tracking-wide text-subtle">Source</p>
+                <p className="mt-1 truncate font-medium">{extracted.fileName}</p>
+                <p className="text-sm text-muted">
+                  {extracted.pageCount} page{extracted.pageCount === 1 ? "" : "s"} · {accepted} redactions
+                </p>
+              </div>
+              <p className="text-xs leading-relaxed text-muted">{openmedNote}</p>
+              {mode === "complex" ? (
+                <>
+                  <DateModePicker dateMode={dateMode} onChange={setDateMode} />
+                  <details className="rounded-md border border-line bg-bg px-3 py-2">
+                    <summary className="cursor-pointer text-sm font-medium">Known identity</summary>
+                    <div className="mt-3">
+                      <SeedForm seed={seed} onChange={setSeed} />
+                      <Button
+                        className="mt-3 w-full"
+                        variant="secondary"
+                        size="sm"
+                        onClick={() => {
+                          if (!extracted) return;
+                          setSpans(supplementWithLocalPhi(extracted.text, openMedSpans, seed));
+                        }}
+                      >
+                        Rescan with identity
+                      </Button>
+                    </div>
+                  </details>
+                  <details className="rounded-md border border-line bg-bg px-3 py-2">
+                    <summary className="cursor-pointer text-sm font-medium">Findings ({spans.length})</summary>
+                    <div className="mt-3">
+                      <FindingsList spans={spans} setSpans={setSpans} />
+                    </div>
+                  </details>
+                  {extracted.extractors?.length ? (
+                    <ExtractorCompare rows={extracted.extractors} onDownload={downloadExtractorCompare} />
+                  ) : null}
+                </>
+              ) : null}
+              <ReportPanel
+                config={config}
+                mode={mode}
+                report={report}
+                reportBusy={reportBusy}
+                reportError={reportError}
+                copied={copied}
+                onCreate={() => void createReport(false)}
+                onCopyReport={() => {
+                  if (report) void copy("report", report);
+                }}
+                onCopyClean={() => void copy("clean", redacted)}
+                onDownload={exportFiles}
+                showKeyFields={showKeyFields}
+                apiKey={apiKey}
+                setApiKey={setApiKey}
+                model={model}
+                setModel={setModel}
+                catalog={catalog}
+                catalogBusy={catalogBusy}
+                catalogError={catalogError}
+              />
+            </aside>
+            <div className="min-w-0">
+              <div className="mb-3 grid grid-cols-2 gap-1 rounded-md bg-mist p-1">
+                <button
+                  type="button"
+                  onClick={() => setDocView("redacted")}
+                  className={cn(
+                    "h-11 rounded-sm px-3 text-sm font-medium",
+                    docView === "redacted" ? "bg-paper text-ink shadow-soft" : "text-muted",
+                  )}
+                >
+                  Redacted
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setDocView("original")}
+                  className={cn(
+                    "h-11 rounded-sm px-3 text-sm font-medium",
+                    docView === "original" ? "bg-paper text-ink shadow-soft" : "text-muted",
+                  )}
+                >
+                  Original (edit)
+                </button>
+              </div>
+              {docView === "redacted" ? (
+                <pre
+                  data-testid="redacted"
+                  className="max-h-[36rem] overflow-auto whitespace-pre-wrap rounded-xl border border-line bg-paper p-4 font-mono text-xs leading-relaxed text-ink shadow-soft sm:text-sm"
+                >
+                  {redacted}
+                </pre>
+              ) : (
+                <RedactDoc text={extracted.text} spans={spans} onChange={setSpans} />
+              )}
+              <p className="mt-3 text-xs leading-relaxed text-subtle">
+                Detectors: {detectors.join(", ") || "none"}. Harbor is a de-identification aid, not a HIPAA
+                certification. The report is built from the Redacted tab, not the original.
+              </p>
+            </div>
+          </section>
         ) : null}
       </div>
     </main>
-  );
-}
-
-function TrustStrip() {
-  const items = [
-    { icon: Shield, title: "PDF stays here", body: "Read with pdf.js in this tab. No upload." },
-    { icon: Cpu, title: "OpenMed on-device", body: "33M clinical PII model. WebGPU, then WASM." },
-    { icon: Check, title: "You approve the send", body: "OpenRouter sees only the reviewed clean text." },
-  ];
-  return (
-    <ul className="grid gap-3 sm:grid-cols-3">
-      {items.map((item) => (
-        <li key={item.title} className="flex gap-3 rounded-lg border border-line bg-paper px-4 py-3">
-          <item.icon className="mt-0.5 size-4 shrink-0 text-accent" />
-          <div>
-            <p className="text-sm font-medium">{item.title}</p>
-            <p className="text-xs leading-relaxed text-muted">{item.body}</p>
-          </div>
-        </li>
-      ))}
-    </ul>
-  );
-}
-
-function SeedForm({ seed, onChange }: { seed: IdentitySeed; onChange: (seed: IdentitySeed) => void }) {
-  const fields: { key: keyof IdentitySeed; label: string }[] = [
-    { key: "fullName", label: "Full name" },
-    { key: "aliases", label: "Aliases / family names" },
-    { key: "dob", label: "DOB" },
-    { key: "mrn", label: "MRN" },
-    { key: "phone", label: "Phone" },
-    { key: "email", label: "Email" },
-    { key: "address", label: "Address" },
-    { key: "zip", label: "ZIP" },
-  ];
-  return (
-    <div className="grid gap-2">
-      {fields.map((field) => (
-        <label key={field.key} className="grid gap-1 text-xs font-medium text-muted">
-          {field.label}
-          <input
-            value={seed[field.key]}
-            onChange={(event) => onChange({ ...seed, [field.key]: event.target.value })}
-            className="h-10 rounded-sm border border-line bg-bg px-3 text-sm text-ink outline-none focus:border-accent"
-          />
-        </label>
-      ))}
-    </div>
-  );
-}
-
-function Review(props: {
-  extracted: ExtractedPdf;
-  spans: PhiSpan[];
-  setSpans: (spans: PhiSpan[] | ((current: PhiSpan[]) => PhiSpan[])) => void;
-  dateMode: DateMode;
-  setDateMode: (mode: DateMode) => void;
-  tab: ReviewTab;
-  setTab: (tab: ReviewTab) => void;
-  accepted: number;
-  redacted: string;
-  detectors: string[];
-  openmedBusy: boolean;
-  openmedNote: string;
-  openmedDevice: string | null;
-  onOpenMed: (deep: boolean) => void;
-  onExport: () => void;
-  onCopy: (value: string) => void;
-  copied: boolean;
-  showSend: boolean;
-  setShowSend: (value: boolean) => void;
-  apiKey: string;
-  setApiKey: (value: string) => void;
-  model: string;
-  setModel: (value: string) => void;
-  summary: string | null;
-  summaryBusy: boolean;
-  onSend: () => void;
-  seed: IdentitySeed;
-  setSeed: (seed: IdentitySeed) => void;
-  onRescan: () => void;
-}) {
-  const originalSegments = segmentText(props.extracted.text, props.spans);
-
-  return (
-    <section className="grid gap-4 lg:grid-cols-[18rem_minmax(0,1fr)]">
-      <aside className="flex flex-col gap-4 rounded-xl border border-line bg-paper p-4 shadow-soft lg:p-5">
-        <div>
-          <p className="text-xs font-medium uppercase tracking-wide text-subtle">Source</p>
-          <p className="mt-1 truncate font-medium">{props.extracted.fileName}</p>
-          <p className="text-sm text-muted">
-            {props.extracted.pageCount} page{props.extracted.pageCount === 1 ? "" : "s"} · {props.accepted} / {props.spans.length} identifiers marked
-          </p>
-        </div>
-
-        <div>
-          <p className="mb-2 text-xs font-medium uppercase tracking-wide text-subtle">Date handling</p>
-          <div className="grid grid-cols-3 gap-1 rounded-md bg-mist p-1">
-            {DATE_MODES.map((mode) => (
-              <button
-                key={mode.id}
-                type="button"
-                onClick={() => props.setDateMode(mode.id)}
-                className={cn(
-                  "rounded-sm px-2 py-2 text-xs font-medium",
-                  props.dateMode === mode.id ? "bg-paper text-ink shadow-soft" : "text-muted",
-                )}
-              >
-                {mode.label}
-              </button>
-            ))}
-          </div>
-          <p className="mt-2 text-xs leading-relaxed text-muted">
-            {DATE_MODES.find((mode) => mode.id === props.dateMode)?.hint}
-          </p>
-        </div>
-
-        <div className="flex flex-col gap-2">
-          <Button onClick={() => props.onOpenMed(false)} disabled={props.openmedBusy}>
-            {props.openmedBusy ? <Loader2 className="size-4 animate-spin" /> : <Cpu className="size-4" />}
-            Scan with OpenMed
-          </Button>
-          <Button variant="secondary" onClick={() => props.onOpenMed(true)} disabled={props.openmedBusy}>
-            Deep scan entire document
-          </Button>
-          <p className="text-xs leading-relaxed text-muted">{props.openmedNote}</p>
-          {props.openmedDevice ? (
-            <p className="text-xs text-accent">Runtime: {props.openmedDevice}</p>
-          ) : null}
-        </div>
-
-        <div className="flex flex-col gap-2">
-          <Button variant="secondary" onClick={props.onExport}>
-            <Download className="size-4" />
-            Download JSON + Markdown
-          </Button>
-          <Button variant="secondary" onClick={() => props.onCopy(props.redacted)}>
-            {props.copied ? <Check className="size-4" /> : <Copy className="size-4" />}
-            {props.copied ? "Copied" : "Copy clean text"}
-          </Button>
-          <Button variant="ghost" onClick={() => props.setShowSend(!props.showSend)}>
-            Summarize with OpenRouter
-          </Button>
-        </div>
-
-        <details className="rounded-md border border-line bg-bg px-3 py-2">
-          <summary className="cursor-pointer text-sm font-medium">Rescan with known identity</summary>
-          <div className="mt-3">
-            <SeedForm seed={props.seed} onChange={props.setSeed} />
-            <Button className="mt-3 w-full" variant="secondary" size="sm" onClick={props.onRescan}>
-              Rescan locally
-            </Button>
-          </div>
-        </details>
-      </aside>
-
-      <div className="flex min-w-0 flex-col gap-4">
-        <div className="flex gap-1 rounded-md bg-mist p-1">
-          {(
-            [
-              ["clean", "Clean report"],
-              ["original", "Original (on device)"],
-              ["findings", `Findings (${props.spans.length})`],
-            ] as const
-          ).map(([id, label]) => (
-            <button
-              key={id}
-              type="button"
-              onClick={() => props.setTab(id)}
-              className={cn(
-                "h-10 flex-1 rounded-sm px-3 text-sm font-medium",
-                props.tab === id ? "bg-paper text-ink shadow-soft" : "text-muted",
-              )}
-            >
-              {label}
-            </button>
-          ))}
-        </div>
-
-        {props.tab === "clean" ? (
-          <pre className="max-h-[32rem] overflow-auto whitespace-pre-wrap rounded-xl border border-line bg-paper p-4 font-mono text-xs leading-relaxed text-ink shadow-soft sm:text-sm">
-            {props.redacted}
-          </pre>
-        ) : null}
-
-        {props.tab === "original" ? (
-          <div className="max-h-[32rem] overflow-auto whitespace-pre-wrap rounded-xl border border-line bg-paper p-4 font-mono text-xs leading-relaxed shadow-soft sm:text-sm">
-            {originalSegments.map((segment, index) =>
-              segment.span ? (
-                <button
-                  key={segment.span.id + index}
-                  type="button"
-                  title={`${CATEGORY_LABEL[segment.span.category]} · click to ${segment.span.accepted ? "keep" : "redact"}`}
-                  onClick={() =>
-                    props.setSpans((current) =>
-                      current.map((span) =>
-                        span.id === segment.span?.id ? { ...span, accepted: !span.accepted } : span,
-                      ),
-                    )
-                  }
-                  className={cn(
-                    "rounded-xs px-0.5",
-                    segment.span.accepted ? "bg-phi-soft text-phi" : "underline decoration-dotted text-muted",
-                  )}
-                >
-                  {segment.text}
-                </button>
-              ) : (
-                <span key={index}>{segment.text}</span>
-              ),
-            )}
-          </div>
-        ) : null}
-
-        {props.tab === "findings" ? (
-          <FindingsList spans={props.spans} setSpans={props.setSpans} />
-        ) : null}
-
-        {props.showSend ? (
-          <div className="rounded-xl border border-line bg-paper p-4 shadow-soft">
-            <h2 className="font-serif text-lg font-medium">Send clean text to OpenRouter</h2>
-            <p className="mt-1 text-sm leading-relaxed text-muted">
-              This is the only network call that includes clinical content. The original PDF is not attached. Your key
-              stays in this browser.
-            </p>
-            <label className="mt-4 grid gap-1 text-xs font-medium text-muted">
-              OpenRouter API key
-              <input
-                type="password"
-                value={props.apiKey}
-                onChange={(event) => props.setApiKey(event.target.value)}
-                className="h-11 rounded-sm border border-line bg-bg px-3 text-sm text-ink outline-none focus:border-accent"
-                placeholder="sk-or-…"
-              />
-            </label>
-            <label className="mt-3 grid gap-1 text-xs font-medium text-muted">
-              Model
-              <select
-                value={props.model}
-                onChange={(event) => props.setModel(event.target.value)}
-                className="h-11 rounded-sm border border-line bg-bg px-3 text-sm text-ink outline-none focus:border-accent"
-              >
-                {OPENROUTER_MODELS.map((item) => (
-                  <option key={item.id} value={item.id}>
-                    {item.label}
-                  </option>
-                ))}
-              </select>
-            </label>
-            <p className="mt-3 text-xs text-muted">{props.redacted.length.toLocaleString()} characters will be sent.</p>
-            <Button className="mt-4" onClick={props.onSend} disabled={props.summaryBusy || !props.apiKey}>
-              {props.summaryBusy ? <Loader2 className="size-4 animate-spin" /> : null}
-              Send reviewed text
-            </Button>
-            {props.summary ? (
-              <pre className="mt-4 max-h-80 overflow-auto whitespace-pre-wrap rounded-md border border-line bg-bg p-3 text-sm leading-relaxed">
-                {props.summary}
-              </pre>
-            ) : null}
-          </div>
-        ) : null}
-
-        <p className="text-xs leading-relaxed text-subtle">
-          Detectors: {props.detectors.join(", ")}. Harbor is a de-identification aid, not a HIPAA certification, a
-          medical device, or a guarantee of zero residual risk. Review the clean report before it leaves this device.
-        </p>
-      </div>
-    </section>
-  );
-}
-
-function FindingsList({
-  spans,
-  setSpans,
-}: {
-  spans: PhiSpan[];
-  setSpans: (spans: PhiSpan[] | ((current: PhiSpan[]) => PhiSpan[])) => void;
-}) {
-  if (spans.length === 0) {
-    return (
-      <div className="rounded-xl border border-line bg-paper p-6 text-sm text-muted shadow-soft">
-        No identifiers found yet. Add a known name/MRN or run OpenMed.
-      </div>
-    );
-  }
-  return (
-    <ul className="max-h-[32rem] overflow-auto rounded-xl border border-line bg-paper shadow-soft">
-      {spans.map((span) => (
-        <li key={span.id} className="flex items-start justify-between gap-3 border-b border-line px-4 py-3 last:border-b-0">
-          <div className="min-w-0">
-            <p className="truncate font-mono text-sm">{span.text}</p>
-            <p className="text-xs text-muted">
-              {CATEGORY_LABEL[span.category]} · {span.source}
-              {span.label ? ` · ${span.label}` : ""}
-            </p>
-          </div>
-          <button
-            type="button"
-            onClick={() =>
-              setSpans((current) =>
-                current.map((item) => (item.id === span.id ? { ...item, accepted: !item.accepted } : item)),
-              )
-            }
-            className={cn(
-              "shrink-0 rounded-sm px-2 py-1 text-xs font-medium",
-              span.accepted ? "bg-phi-soft text-phi" : "bg-mist text-muted",
-            )}
-          >
-            {span.accepted ? "Redacting" : "Kept"}
-          </button>
-        </li>
-      ))}
-    </ul>
   );
 }

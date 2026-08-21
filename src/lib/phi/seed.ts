@@ -1,4 +1,4 @@
-import type { IdentitySeed, PhiSpan } from "./types";
+import type { IdentitySeed, PhiSpan } from "./types.ts";
 
 function uniquePieces(seed: IdentitySeed): string[] {
   const pieces = [

@@ -377,12 +377,11 @@ test("browser-smoke wires the guard and verdict helpers", () => {
   assert.match(src, /from "\.\/browser-smoke-verdict\.mjs"/);
   assert.match(src, /const args = parseSmokeArgs\(process\.argv\.slice\(2\), process\.env\)/);
   assert.match(src, /const url = checkedUrl\(args\.url\)/);
-  assert.match(src, /const SCRIPT_WORKSPACE = dirname\(dirname\(fileURLToPath\(import\.meta\.url\)\)\)/);
-  assert.match(src, /const SCREENSHOT_ROOTS = \["\/workspace", SCRIPT_WORKSPACE\]/);
-  assert.match(src, /const outPng = checkedOutputPath\(args\.outPng, SCREENSHOT_ROOTS\)/);
-  assert.match(src, /const mobilePng = checkedOutputPath\(derived\.mobilePng, SCREENSHOT_ROOTS\)/);
-  assert.match(src, /const outJson = checkedOutputPath\(derived\.verdictJson, SCREENSHOT_ROOTS/);
-  assert.match(src, /checkedOutputPath\(realpathSync\(args\.baseline\), SCREENSHOT_ROOTS/);
+  assert.match(src, /const screenshotRoots = \["\/workspace", resolve\(process\.cwd\(\)\)\]/);
+  assert.match(src, /const outPng = checkedOutputPath\(args\.outPng, screenshotRoots\)/);
+  assert.match(src, /const mobilePng = checkedOutputPath\(derived\.mobilePng, screenshotRoots\)/);
+  assert.match(src, /const outJson = checkedOutputPath\(derived\.verdictJson, screenshotRoots/);
+  assert.match(src, /checkedOutputPath\(realpathSync\(args\.baseline\), screenshotRoots/);
   assert.match(src, /baselinePath === outJson/);
   assert.match(src, /normalizedBodyTextHash\(/);
   assert.match(src, /bodyTextPrefix\(/);

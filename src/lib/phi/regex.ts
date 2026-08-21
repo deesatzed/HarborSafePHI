@@ -1,4 +1,4 @@
-import type { PhiCategory, PhiSpan } from "./types";
+import type { PhiCategory, PhiSpan } from "./types.ts";
 
 type Pattern = {
   category: PhiCategory;
@@ -120,6 +120,19 @@ const PATTERNS: Pattern[] = [
     source: "regex",
     confidence: 0.8,
     re: /\b(?:AL|AK|AZ|AR|CA|CO|CT|DE|FL|GA|HI|IA|ID|IL|IN|KS|KY|LA|MA|MD|ME|MI|MN|MO|MS|MT|NC|ND|NE|NH|NJ|NM|NV|NY|OH|OK|OR|PA|RI|SC|SD|TN|TX|UT|VA|VT|WA|WI|WV|WY)\s+(\d{5}(?:-\d{4})?)\b/g,
+    group: 1,
+  },
+  {
+    category: "address",
+    source: "regex",
+    confidence: 0.9,
+    re: /\b[A-Z][A-Za-z.'-]{2,}(?:[\s]+[A-Z][A-Za-z.'-]{2,}){0,3},?\s+(?:AL|AK|AZ|AR|CA|CO|CT|DE|FL|GA|HI|IA|ID|IL|IN|KS|KY|LA|MA|MD|ME|MI|MN|MO|MS|MT|NC|ND|NE|NH|NJ|NM|NV|NY|OH|OK|OR|PA|RI|SC|SD|TN|TX|UT|VA|VT|WA|WI|WV|WY)\s+\d{5}(?:-\d{4})?\b/g,
+  },
+  {
+    category: "address",
+    source: "label",
+    confidence: 0.94,
+    re: /\bPatient Address\s*[:#]?\s*([^\n]+)/gi,
     group: 1,
   },
   {

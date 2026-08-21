@@ -1,9 +1,35 @@
-import type { ExtractedPdf } from "./types";
+import type { ExtractedPdf } from "./types.ts";
+import {
+  joinPageTexts,
+  reconstructPageText,
+  snapshotExtractors,
+  type PdfTextSpan,
+} from "./pdf-text.ts";
 
-type TextItem = {
+type PdfJsTextItem = {
   str?: string;
   transform?: number[];
+  width?: number;
+  height?: number;
+  hasEOL?: boolean;
 };
+
+function spansFromContent(items: PdfJsTextItem[]): PdfTextSpan[] {
+  const spans: PdfTextSpan[] = [];
+  for (const item of items) {
+    if (typeof item.str !== "string") continue;
+    const transform = item.transform;
+    spans.push({
+      str: item.str,
+      x: transform?.[4] ?? 0,
+      y: transform?.[5] ?? 0,
+      width: item.width ?? 0,
+      height: item.height ?? Math.abs(transform?.[3] ?? 0),
+      hasEOL: Boolean(item.hasEOL),
+    });
+  }
+  return spans;
+}
 
 export async function extractPdfText(file: File): Promise<ExtractedPdf> {
   const pdfjs = await import("pdfjs-dist");
@@ -12,46 +38,35 @@ export async function extractPdfText(file: File): Promise<ExtractedPdf> {
 
   const data = new Uint8Array(await file.arrayBuffer());
   const doc = await pdfjs.getDocument({ data }).promise;
-  const pages: ExtractedPdf["pages"] = [];
+  const pageItems: PdfTextSpan[][] = [];
 
   for (let pageNumber = 1; pageNumber <= doc.numPages; pageNumber += 1) {
     const page = await doc.getPage(pageNumber);
     const content = await page.getTextContent();
-    const items = content.items as TextItem[];
-    let text = "";
-    let lastY: number | null = null;
-    for (const item of items) {
-      const str = item.str ?? "";
-      if (!str) continue;
-      const y = item.transform?.[5];
-      if (lastY !== null && y !== undefined && Math.abs(y - lastY) > 3) {
-        text += "\n";
-      } else if (text && !text.endsWith("\n") && !text.endsWith(" ") && !str.startsWith(" ")) {
-        const glue = /[A-Za-z0-9]$/.test(text) && /^[A-Za-z0-9]/.test(str) ? " " : "";
-        text += glue;
-      }
-      text += str;
-      if (y !== undefined) lastY = y;
-    }
-    pages.push({ pageNumber, text: text.trim() });
+    pageItems.push(spansFromContent(content.items as PdfJsTextItem[]));
   }
 
-  const joined = pages
-    .map((page) => (pages.length > 1 ? `--- Page ${page.pageNumber} ---\n${page.text}` : page.text))
-    .join("\n\n");
+  const extractors = snapshotExtractors(pageItems);
+  const pages = pageItems.map((items, index) => ({
+    pageNumber: index + 1,
+    text: reconstructPageText(items, "layout"),
+  }));
+  const text = joinPageTexts(pages, doc.numPages);
 
   return {
     fileName: file.name,
     pageCount: doc.numPages,
-    text: joined,
+    text,
     pages,
-    hasTextLayer: joined.replace(/\s/g, "").length > 20,
+    hasTextLayer: text.replace(/\s/g, "").length > 20,
+    extractor: "layout",
+    extractors,
   };
 }
 
 export async function buildSamplePdf(): Promise<File> {
   const { PDFDocument, StandardFonts, rgb } = await import("pdf-lib");
-  const { SAMPLE_CHART, SAMPLE_FILE_NAME } = await import("./sample-chart");
+  const { SAMPLE_CHART, SAMPLE_FILE_NAME } = await import("./sample-chart.ts");
   const pdf = await PDFDocument.create();
   const font = await pdf.embedFont(StandardFonts.Courier);
   const chunks = SAMPLE_CHART.split("--- Page 2 ---");

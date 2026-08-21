@@ -9,8 +9,10 @@ import {
   APP_ENV_REL_PATH,
   mergeAppEnv,
   parseAppEnv,
+  parseDotEnv,
   projectRoot,
   readAppEnv,
+  readDotEnv,
 } from "./with-app-env.mjs";
 
 const execFileAsync = promisify(execFile);
@@ -43,6 +45,24 @@ test("drops non-VITE keys, non-string values and malformed documents", () => {
 
 test("a missing app-env.json is a clean no-op", () => {
   assert.deepEqual(readAppEnv(makeWorkspace()), {});
+});
+
+test("parseDotEnv reads unquoted and quoted keys", () => {
+  const parsed = parseDotEnv('OPENROUTER_API_KEY="sk-or-x"\nOPENROUTER_MODEL_1=google/gemini-3.7-flash\n');
+  assert.equal(parsed.OPENROUTER_API_KEY, "sk-or-x");
+  assert.equal(parsed.OPENROUTER_MODEL_1, "google/gemini-3.7-flash");
+});
+
+test("a missing .env is a clean no-op", () => {
+  assert.deepEqual(readDotEnv(makeWorkspace()), {});
+});
+
+test("readDotEnv loads OPENROUTER keys from .env", () => {
+  const root = makeWorkspace('{"VITE_AUTH_ENABLED":"false"}');
+  writeFileSync(join(root, ".env"), "OPENROUTER_API_KEY=sk-or-file\nOPENROUTER_MODEL_1=google/gemini-3.7-flash\n");
+  const env = readDotEnv(root);
+  assert.equal(env.OPENROUTER_API_KEY, "sk-or-file");
+  assert.equal(env.OPENROUTER_MODEL_1, "google/gemini-3.7-flash");
 });
 
 test("reads the app env from a workspace", () => {

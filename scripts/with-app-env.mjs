@@ -26,6 +26,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 export const APP_ENV_REL_PATH = ".grok/app-env.json";
+export const DOTENV_REL_PATH = ".env";
 
 const VITE_PREFIX = "VITE_";
 
@@ -58,6 +59,42 @@ export function readAppEnv(root) {
   } catch {
     return {};
   }
+}
+
+/** Parse a dotenv body. Quotes are stripped; comments and blanks are skipped. */
+export function parseDotEnv(text) {
+  const env = {};
+  for (const raw of String(text).split(/\r?\n/)) {
+    const line = raw.trim();
+    if (!line || line.startsWith("#")) continue;
+    const stripped = line.startsWith("export ") ? line.slice(7).trim() : line;
+    const eq = stripped.indexOf("=");
+    if (eq <= 0) continue;
+    const key = stripped.slice(0, eq).trim();
+    if (!key) continue;
+    let value = stripped.slice(eq + 1).trim();
+    if (
+      (value.startsWith('"') && value.endsWith('"')) ||
+      (value.startsWith("'") && value.endsWith("'"))
+    ) {
+      value = value.slice(1, -1);
+    }
+    env[key] = value;
+  }
+  return env;
+}
+
+/** Local `.env` then `.env.local`, or `{}` when neither exists. */
+export function readDotEnv(root) {
+  let env = {};
+  for (const name of [DOTENV_REL_PATH, ".env.local"]) {
+    try {
+      env = { ...env, ...parseDotEnv(readFileSync(join(root, name), "utf8")) };
+    } catch {
+      /* missing is fine */
+    }
+  }
+  return env;
 }
 
 /** File values under the process environment: an explicit override wins. */
@@ -110,7 +147,8 @@ function main(argv) {
     console.error("usage: node scripts/with-app-env.mjs <command> [args…]");
     process.exit(2);
   }
-  const env = mergeAppEnv(readAppEnv(projectRoot()), process.env);
+  const root = projectRoot();
+  const env = { ...readAppEnv(root), ...readDotEnv(root), ...process.env };
   const child = spawn(command, args, { stdio: "inherit", env });
   // The dev server is long-running and is stopped by signalling this wrapper.
   for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"]) {

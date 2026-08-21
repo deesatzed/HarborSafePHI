@@ -1,6 +1,6 @@
-import { countByCategory } from "./detect";
-import { redactText } from "./redact";
-import type { DateMode, ExtractedPdf, PhiSpan } from "./types";
+import { countByCategory } from "./detect.ts";
+import { redactText } from "./redact.ts";
+import type { DateMode, ExtractedPdf, PhiSpan } from "./types.ts";
 
 export type HarborExport = {
   schema: "harbor-clinical-extract-v1";
@@ -23,6 +23,7 @@ export function buildExport(args: {
   spans: PhiSpan[];
   dateMode: DateMode;
   detectors: string[];
+  report?: string | null;
 }): { json: HarborExport; markdown: string; redacted: string } {
   const redaction = redactText(args.extracted.text, args.spans, args.dateMode);
   const findings = countByCategory(args.spans);
@@ -50,13 +51,17 @@ export function buildExport(args: {
   };
 
   const markdown = [
+    ...(args.report
+      ? [`# Clinical summary`, ``, args.report.trim(), ``, `---`, ``]
+      : []),
     `# De-identified clinical extract`,
     ``,
     `Source file: ${args.extracted.fileName} (${args.extracted.pageCount} page${args.extracted.pageCount === 1 ? "" : "s"})`,
     `Date mode: ${args.dateMode}${redaction.originIso ? ` · index ${redaction.originIso}` : ""}`,
     `Findings accepted: ${redaction.acceptedCount} / ${args.spans.length}`,
+    `PDF text: ${args.extracted.extractor ?? "layout"}`,
     ``,
-    `## Report`,
+    `## De-identified extract`,
     ``,
     redaction.redacted.trim(),
     ``,

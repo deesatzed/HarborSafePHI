@@ -1,7 +1,7 @@
-import { mergeSpans } from "./merge";
-import { detectGeneratedFor, detectProviderNames, detectRegexSpans, detectRepeatedLastNames } from "./regex";
-import { detectSeedSpans } from "./seed";
-import type { IdentitySeed, PhiSpan } from "./types";
+import { mergeSpans } from "./merge.ts";
+import { detectGeneratedFor, detectProviderNames, detectRegexSpans, detectRepeatedLastNames } from "./regex.ts";
+import { detectSeedSpans } from "./seed.ts";
+import type { IdentitySeed, PhiSpan } from "./types.ts";
 
 function propagateLabeledIdentities(text: string, spans: PhiSpan[]): PhiSpan[] {
   const extra: PhiSpan[] = [];
@@ -56,6 +56,24 @@ export function detectLocalPhi(text: string, seed: IdentitySeed): PhiSpan[] {
   ];
   const first = mergeSpans(text, combined);
   return mergeSpans(text, [...first, ...propagateLabeledIdentities(text, first)]);
+}
+
+export function supplementWithLocalPhi(
+  text: string,
+  openMedSpans: PhiSpan[],
+  seed: IdentitySeed = {
+    fullName: "",
+    aliases: "",
+    dob: "",
+    mrn: "",
+    phone: "",
+    email: "",
+    address: "",
+    zip: "",
+  },
+): PhiSpan[] {
+  const local = detectLocalPhi(text, seed);
+  return mergeSpans(text, [...openMedSpans, ...local]);
 }
 
 export function mergeDetectorPasses(text: string, passes: PhiSpan[][]): PhiSpan[] {

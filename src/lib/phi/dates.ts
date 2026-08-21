@@ -1,4 +1,4 @@
-import type { DateMode, PhiSpan } from "./types";
+import type { DateMode, PhiSpan } from "./types.ts";
 
 const DATE_RE =
   /^((?:0?[1-9]|1[0-2])[/-](?:0?[1-9]|[12]\d|3[01])[/-](?:19|20)\d{2}|(?:19|20)\d{2}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12]\d|3[01])|(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)[a-z]*\.?\s+\d{1,2},?\s+(?:19|20)\d{2})$/i;
@@ -45,13 +45,18 @@ export function looksLikeDate(value: string): boolean {
   return DATE_RE.test(value.trim());
 }
 
+const FORTY_YEARS_MS = 40 * 365.25 * 86_400_000;
+
 export function indexDate(spans: PhiSpan[]): Date | null {
   const dates = spans
     .filter((span) => span.category === "date")
     .map((span) => parseDate(span.text))
     .filter((date): date is Date => Boolean(date))
     .sort((a, b) => a.getTime() - b.getTime());
-  return dates[0] ?? null;
+  if (dates.length === 0) return null;
+  const newest = dates[dates.length - 1];
+  const clinical = dates.filter((date) => newest.getTime() - date.getTime() <= FORTY_YEARS_MS);
+  return clinical[0] ?? newest;
 }
 
 export function formatDateToken(span: PhiSpan, mode: DateMode, origin: Date | null): string {
