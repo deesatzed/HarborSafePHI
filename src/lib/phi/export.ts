@@ -5,7 +5,7 @@ import type { DateMode, ExtractedPdf, PhiSpan } from "./types.ts";
 export type HarborExport = {
   schema: "harbor-clinical-extract-v1";
   generatedAt: string;
-  source: { fileName: string; pageCount: number };
+  source: { fileName: string; pageCount: number | null };
   deid: {
     method: "safe_harbor_plus_review";
     dateMode: DateMode;
@@ -56,7 +56,9 @@ export function buildExport(args: {
       : []),
     `# De-identified clinical extract`,
     ``,
-    `Source file: ${args.extracted.fileName} (${args.extracted.pageCount} page${args.extracted.pageCount === 1 ? "" : "s"})`,
+    `Source file: ${args.extracted.fileName} · Pages: ${
+      args.extracted.pageCount === null ? "Unknown" : args.extracted.pageCount
+    }`,
     `Date mode: ${args.dateMode}${redaction.originIso ? ` · index ${redaction.originIso}` : ""}`,
     `Findings accepted: ${redaction.acceptedCount} / ${args.spans.length}`,
     `PDF text: ${args.extracted.extractor ?? "layout"}`,

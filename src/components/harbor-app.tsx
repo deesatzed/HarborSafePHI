@@ -12,13 +12,20 @@ import {
 import { RedactDoc } from "@/components/redact-doc";
 import { detectLocalPhi, supplementWithLocalPhi } from "@/lib/phi/detect";
 import { buildExport, downloadTextFile } from "@/lib/phi/export";
-import { buildSamplePdf, extractPdfText } from "@/lib/phi/extract-pdf";
+import { extractDocumentText } from "@/lib/phi/extract-document";
+import { buildSamplePdf } from "@/lib/phi/extract-pdf";
 import { prepareModelInput } from "@/lib/phi/packet";
 import { formatExtractorCompare } from "@/lib/phi/pdf-text";
 import { isOpenMedCached, scanWithOpenMed } from "@/lib/phi/openmed";
 import { redactText } from "@/lib/phi/redact";
 import { SAMPLE_CHART, SAMPLE_FILE_NAME } from "@/lib/phi/sample-chart";
-import { EMPTY_SEED, type DateMode, type ExtractedPdf, type IdentitySeed, type PhiSpan } from "@/lib/phi/types";
+import {
+  EMPTY_SEED,
+  type DateMode,
+  type ExtractedDocument,
+  type IdentitySeed,
+  type PhiSpan,
+} from "@/lib/phi/types";
 import {
   fetchOpenRouterModels,
   readOpenRouterKey,
@@ -44,9 +51,9 @@ export function HarborApp() {
   const inputRef = useRef<HTMLInputElement>(null);
   const [mode, setMode] = useState<HarborMode>(readMode);
   const [stage, setStage] = useState<Stage>("idle");
-  const [status, setStatus] = useState("Reading PDF…");
+  const [status, setStatus] = useState("Reading document…");
   const [error, setError] = useState<string | null>(null);
-  const [extracted, setExtracted] = useState<ExtractedPdf | null>(null);
+  const [extracted, setExtracted] = useState<ExtractedDocument | null>(null);
   const [spans, setSpans] = useState<PhiSpan[]>([]);
   const [openMedSpans, setOpenMedSpans] = useState<PhiSpan[]>([]);
   const [detectors, setDetectors] = useState<string[]>([]);
@@ -107,7 +114,19 @@ export function HarborApp() {
 
   const reportFingerprint = useMemo(() => `${dateMode}:${redacted.length}:${accepted}`, [dateMode, redacted, accepted]);
 
-  async function runPipeline(extractedDoc: ExtractedPdf) {
+  function clearDerivedState() {
+    setExtracted(null);
+    setSpans([]);
+    setOpenMedSpans([]);
+    setDetectors([]);
+    setOpenmedNote("");
+    setReport(null);
+    setReportError(null);
+    setCopied(null);
+    autoReportFor.current = null;
+  }
+
+  async function runPipeline(extractedDoc: ExtractedDocument) {
     setExtracted(extractedDoc);
     setCopied(null);
     setDocView("redacted");
@@ -145,7 +164,7 @@ export function HarborApp() {
     setDetectors(used);
     setStage("review");
     if (!extractedDoc.hasTextLayer) {
-      setError("This PDF has no selectable text. Harbor cannot OCR scans yet — use a text PDF from MyChart, not a photograph.");
+      setError("This document has too little readable text. Harbor cannot OCR scans yet — use a text PDF or DOCX, not a photograph.");
     } else if (nextOpenMed.length > 0) {
       setError(null);
     }
@@ -155,15 +174,16 @@ export function HarborApp() {
   }
 
   async function onFile(file: File) {
+    clearDerivedState();
     setError(null);
     setStage("working");
-    setStatus("Reading PDF in this browser…");
+    setStatus("Reading document in this browser…");
     try {
-      const extractedDoc = await extractPdfText(file);
+      const extractedDoc = await extractDocumentText(file);
       await runPipeline(extractedDoc);
     } catch (err) {
       setStage("idle");
-      setError(err instanceof Error ? err.message : "Could not read that PDF.");
+      setError(err instanceof Error ? err.message : "Could not read that document.");
     }
   }
 
@@ -176,6 +196,7 @@ export function HarborApp() {
       await onFile(file);
     } catch {
       await runPipeline({
+        kind: "pdf",
         fileName: SAMPLE_FILE_NAME,
         pageCount: 2,
         text: SAMPLE_CHART,
@@ -191,21 +212,14 @@ export function HarborApp() {
 
   function reset() {
     setStage("idle");
-    setExtracted(null);
-    setSpans([]);
-    setOpenMedSpans([]);
+    clearDerivedState();
     setError(null);
-    setOpenmedNote("");
-    setReport(null);
-    setReportError(null);
-    setCopied(null);
-    autoReportFor.current = null;
   }
 
   function exportFiles() {
     if (!extracted) return;
     const payload = buildExport({ extracted, spans, dateMode, detectors, report });
-    const base = extracted.fileName.replace(/\.pdf$/i, "") + "-deidentified";
+    const base = extracted.fileName.replace(/\.(pdf|docx)$/i, "") + "-deidentified";
     downloadTextFile(`${base}.md`, payload.markdown, "text/markdown");
     downloadTextFile(`${base}.json`, JSON.stringify(payload.json, null, 2), "application/json");
   }
@@ -288,7 +302,7 @@ export function HarborApp() {
             </h1>
             <p className="mt-3 max-w-prose text-sm leading-relaxed text-muted sm:text-base">
               {mode === "simple"
-                ? "Drop a PDF, fix the highlights, and Harbor writes the report. Download it or copy it."
+                ? "Drop a PDF or DOCX, fix the highlights, and Harbor writes the report. Download it or copy it."
                 : "Full controls: known identity, date handling, findings, and OpenRouter when no server secret is set."}
             </p>
           </div>
@@ -306,7 +320,7 @@ export function HarborApp() {
         {mode === "simple" ? (
           <ul className="grid gap-3 sm:grid-cols-3">
             {[
-              { icon: Shield, title: "1. Add a file", body: "PDF stays in this tab." },
+              { icon: Shield, title: "1. Add a file", body: "PDF or DOCX stays in this tab." },
               { icon: Cpu, title: "2. Check highlights", body: "OpenMed first, then you edit." },
               { icon: Check, title: "3. Report", body: "Download or copy when it lands." },
             ].map((item) => (
@@ -322,7 +336,7 @@ export function HarborApp() {
         ) : (
           <ul className="grid gap-3 sm:grid-cols-3">
             {[
-              { icon: Shield, title: "PDF stays here", body: "Read with pdf.js in this tab." },
+              { icon: Shield, title: "File stays here", body: "PDF or DOCX stays in this tab." },
               { icon: Cpu, title: "OpenMed first", body: "Cached on this device after one download." },
               { icon: Check, title: "You control send", body: "Server secret or a key you paste." },
             ].map((item) => (
@@ -381,7 +395,7 @@ export function HarborApp() {
                   <span className="flex size-12 items-center justify-center rounded-md bg-accent-soft text-accent">
                     <FileUp className="size-6" />
                   </span>
-                  <p className="font-medium">Drop a MyChart PDF here</p>
+                  <p className="font-medium">Drop a MyChart PDF or DOCX here</p>
                   <p className="max-w-sm text-sm text-muted">OpenMed starts as soon as the file is in this tab.</p>
                 </>
               )}
@@ -389,7 +403,7 @@ export function HarborApp() {
             <input
               ref={inputRef}
               type="file"
-              accept="application/pdf,.pdf"
+              accept="application/pdf,.pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document,.docx"
               className="sr-only"
               onChange={(event) => {
                 const file = event.target.files?.[0];
@@ -401,7 +415,7 @@ export function HarborApp() {
               <div>
                 <h2 className="font-serif text-lg font-medium">No chart handy?</h2>
                 <p className="mt-2 text-sm leading-relaxed text-muted">
-                  The sample is synthetic. Use it to confirm the flow, then drop a real text PDF from MyChart.
+                  The sample is synthetic. Use it to confirm the flow, then drop a real text PDF or DOCX from MyChart.
                 </p>
               </div>
               <Button
@@ -421,7 +435,9 @@ export function HarborApp() {
                 <p className="text-xs font-medium uppercase tracking-wide text-subtle">Source</p>
                 <p className="mt-1 truncate font-medium">{extracted.fileName}</p>
                 <p className="text-sm text-muted">
-                  {extracted.pageCount} page{extracted.pageCount === 1 ? "" : "s"} · {accepted} redactions
+                  {extracted.pageCount === null
+                    ? "Page count unavailable"
+                    : `${extracted.pageCount} page${extracted.pageCount === 1 ? "" : "s"}`} · {accepted} redactions
                 </p>
               </div>
               <p className="text-xs leading-relaxed text-muted">{openmedNote}</p>

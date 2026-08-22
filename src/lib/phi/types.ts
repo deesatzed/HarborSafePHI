@@ -72,15 +72,19 @@ export type ExtractorSnapshot = {
   letterDigitGlue: number;
 };
 
-export type ExtractedPdf = {
+export type ExtractedDocument = {
+  kind: "pdf" | "docx";
   fileName: string;
-  pageCount: number;
+  pageCount: number | null;
   text: string;
   pages: { pageNumber: number; text: string }[];
   hasTextLayer: boolean;
   extractor?: ExtractorId;
   extractors?: ExtractorSnapshot[];
 };
+
+/** @deprecated Use ExtractedDocument for PDF and DOCX inputs. */
+export type ExtractedPdf = ExtractedDocument;
 
 export const CATEGORY_TOKEN: Record<PhiCategory, string> = {
   name: "[NAME]",

@@ -1,5 +1,5 @@
 {
-  "name": "app-builder-workspace",
+  "name": "harbor-safe-phi",
   "private": true,
   "sideEffects": false,
   "type": "module",
@@ -14,7 +14,7 @@
     "preview": "node scripts/with-app-env.mjs vite preview",
     "typecheck": "tsc --noEmit",
     "check:auth": "node scripts/check-auth-invariant.mjs",
-    "test": "node --test 'scripts/**/*.test.mjs' && node --experimental-strip-types --test src/lib/app-data/app-data.test.ts src/lib/auth/gate-identity.test.ts src/lib/phi/detect.test.ts src/lib/phi/manual.test.ts src/lib/phi/pdf-text.test.ts src/lib/phi/packet.test.ts src/lib/openrouter-env.test.ts src/lib/openrouter-parse.test.ts",
+    "test": "node --test 'scripts/**/*.test.mjs' && node --experimental-strip-types --test src/lib/app-data/app-data.test.ts src/lib/auth/gate-identity.test.ts src/lib/phi/detect.test.ts src/lib/phi/export.test.ts src/lib/phi/extract-document.test.ts src/lib/phi/manual.test.ts src/lib/phi/pdf-text.test.ts src/lib/phi/packet.test.ts src/lib/openrouter-env.test.ts src/lib/openrouter-parse.test.ts",
     "lint": "eslint .",
     "format": "prettier --write ."
   },
@@ -57,6 +57,7 @@
     "jose": "6.2.9",
     "kysely": "^0.28.5",
     "lucide-react": "^0.510.0",
+    "mammoth": "^1.12.1",
     "openmed": "^2.1.0",
     "pdf-lib": "^1.17.1",
     "pdfjs-dist": "^6.2.108",
