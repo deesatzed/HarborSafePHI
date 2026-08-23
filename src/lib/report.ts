@@ -10,6 +10,10 @@ import {
   type OpenRouterChatJson,
 } from "@/lib/openrouter";
 import { prepareModelInput } from "@/lib/phi/packet";
+import {
+  validateApprovedReportInput,
+  type ApprovedReportInput,
+} from "@/lib/phi/review";
 
 function envForReport(): Record<string, string | undefined> {
   let fromFiles: Record<string, string> = {};
@@ -29,16 +33,23 @@ export const getReportConfig = createServerFn({ method: "GET" }).handler(async (
 });
 
 export const generateServerReport = createServerFn({ method: "POST" })
-  .validator((input: { redactedText: string; model?: string }) => {
-    if (!input || typeof input.redactedText !== "string") {
+  .validator((input: ApprovedReportInput) => {
+    if (
+      !input ||
+      typeof input.redactedText !== "string" ||
+      typeof input.redactedSha256 !== "string"
+    ) {
       throw new Error("Missing de-identified text.");
     }
     return {
       redactedText: input.redactedText,
+      redactedSha256: input.redactedSha256,
+      dateMode: input.dateMode,
       model: typeof input.model === "string" ? input.model : "",
     };
   })
   .handler(async ({ data }) => {
+    const approvedInput = await validateApprovedReportInput(data);
     const parsed = serverOpenRouterFromEnv(envForReport());
     if (!parsed.configured) {
       return {
@@ -47,10 +58,10 @@ export const generateServerReport = createServerFn({ method: "POST" })
           "OPENROUTER_API_KEY and OPENROUTER_MODEL (or OPENROUTER_MODEL_1) are not both set in .env / Fly secrets.",
       };
     }
-    const requested = data.model.trim();
+    const requested = approvedInput.model?.trim() ?? "";
     const model =
       requested && parsed.models.includes(requested) ? requested : parsed.model;
-    const redactedText = data.redactedText.trim();
+    const redactedText = approvedInput.redactedText.trim();
     if (redactedText.length < 20) {
       return { ok: false as const, error: "The de-identified text is too short to report." };
     }

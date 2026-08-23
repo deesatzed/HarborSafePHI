@@ -19,6 +19,14 @@ import { prepareModelInput } from "@/lib/phi/packet";
 import { formatExtractorCompare } from "@/lib/phi/pdf-text";
 import { isOpenMedCached, scanWithOpenMed } from "@/lib/phi/openmed";
 import { redactText } from "@/lib/phi/redact";
+import {
+  approveReview,
+  reviewFingerprint,
+  reviewIsCurrent,
+  sha256Hex,
+  type ReviewApproval,
+  type ReviewedRepresentation,
+} from "@/lib/phi/review";
 import { SAMPLE_CHART, SAMPLE_FILE_NAME } from "@/lib/phi/sample-chart";
 import {
   EMPTY_SEED,
@@ -42,6 +50,37 @@ import { cn } from "@/lib/utils";
 
 type Stage = "idle" | "working" | "review";
 type HarborMode = "simple" | "complex";
+
+type ReviewSnapshot = {
+  extracted: ExtractedDocument | null;
+  spans: PhiSpan[];
+  dateMode: DateMode;
+  redacted: string;
+};
+
+function sameReviewSnapshot(left: ReviewSnapshot, right: ReviewSnapshot): boolean {
+  return (
+    left.extracted === right.extracted &&
+    left.spans === right.spans &&
+    left.dateMode === right.dateMode &&
+    left.redacted === right.redacted
+  );
+}
+
+async function reviewedRepresentation(
+  snapshot: ReviewSnapshot,
+): Promise<ReviewedRepresentation | null> {
+  const document = snapshot.extracted;
+  if (!document) return null;
+  return {
+    sourceTextSha256: await sha256Hex(document.text),
+    dateMode: snapshot.dateMode,
+    redactedText: snapshot.redacted,
+    findings: snapshot.spans,
+  };
+}
+
+type SummaryIdentity = { requestId: number; reviewSha256: string };
 
 function readMode(): HarborMode {
   if (typeof window === "undefined") return "simple";
@@ -70,6 +109,10 @@ export function HarborApp() {
   const [report, setReport] = useState<string | null>(null);
   const [reportBusy, setReportBusy] = useState(false);
   const [reportError, setReportError] = useState<string | null>(null);
+  const [approval, setApproval] = useState<ReviewApproval | null>(null);
+  const [approvedReviewKey, setApprovedReviewKey] = useState<string | null>(null);
+  const [reviewKey, setReviewKey] = useState<string | null>(null);
+  const [approvalBusy, setApprovalBusy] = useState(false);
   const [apiKey, setApiKey] = useState(() => (typeof window === "undefined" ? "" : readOpenRouterKey()));
   const [model, setModel] = useState(() => (typeof window === "undefined" ? "" : readOpenRouterModel()));
   const [catalog, setCatalog] = useState<OpenRouterModel[]>([]);
@@ -79,6 +122,20 @@ export function HarborApp() {
   const redacted = extracted ? redactText(extracted.text, spans, dateMode).redacted : "";
   const accepted = spans.filter((span) => span.accepted).length;
   const showKeyFields = mode === "complex" && !config?.configured;
+  const approvalRef = useRef<ReviewApproval | null>(null);
+  const approvedReviewKeyRef = useRef<string | null>(null);
+  const reviewKeyRef = useRef<string | null>(null);
+  const reviewComputationId = useRef(0);
+  const approvalRequestId = useRef(0);
+  const summaryRequestId = useRef(0);
+  const currentReview = useRef<ReviewSnapshot>({ extracted, spans, dateMode, redacted });
+  currentReview.current = { extracted, spans, dateMode, redacted };
+  const reviewApproved = Boolean(
+    approval &&
+      reviewKey &&
+      approvedReviewKey === reviewKey &&
+      approval.reviewSha256 === reviewKey,
+  );
 
   useEffect(() => {
     setHydrated(true);
@@ -118,27 +175,195 @@ export function HarborApp() {
     };
   }, [showKeyFields]);
 
-  function clearDerivedState() {
-    setExtracted(null);
-    setSpans([]);
-    setOpenMedSpans([]);
-    setDetectors([]);
-    setOpenmedNote("");
+  useEffect(() => {
+    const snapshot = currentReview.current;
+    const computationId = ++reviewComputationId.current;
+    ++summaryRequestId.current;
+    approvalRef.current = null;
+    approvedReviewKeyRef.current = null;
+    reviewKeyRef.current = null;
+    setApproval(null);
+    setApprovedReviewKey(null);
+    setReviewKey(null);
+    setApprovalBusy(false);
+    setReport(null);
+    setReportBusy(false);
+    setReportError(null);
+    setCopied(null);
+    if (!snapshot.extracted) return;
+
+    void (async () => {
+      const nextReview = await reviewedRepresentation(snapshot);
+      if (
+        !nextReview ||
+        computationId !== reviewComputationId.current ||
+        !sameReviewSnapshot(snapshot, currentReview.current)
+      ) {
+        return;
+      }
+      const nextReviewKey = await reviewFingerprint(nextReview);
+      if (
+        computationId !== reviewComputationId.current ||
+        !sameReviewSnapshot(snapshot, currentReview.current)
+      ) {
+        return;
+      }
+      reviewKeyRef.current = nextReviewKey;
+      setReviewKey(nextReviewKey);
+    })();
+  }, [dateMode, extracted, redacted, spans]);
+
+  function invalidateReview() {
+    ++reviewComputationId.current;
+    ++approvalRequestId.current;
+    ++summaryRequestId.current;
+    approvalRef.current = null;
+    approvedReviewKeyRef.current = null;
+    reviewKeyRef.current = null;
+    setApproval(null);
+    setApprovedReviewKey(null);
+    setReviewKey(null);
+    setApprovalBusy(false);
     setReport(null);
     setReportBusy(false);
     setReportError(null);
     setCopied(null);
   }
 
+  function setReviewedSpans(
+    next: PhiSpan[] | ((current: PhiSpan[]) => PhiSpan[]),
+  ) {
+    invalidateReview();
+    setSpans(next);
+  }
+
+  function setReviewedDateMode(next: DateMode) {
+    if (next === dateMode) return;
+    invalidateReview();
+    setDateMode(next);
+  }
+
+  function summaryIsCurrent(identity: SummaryIdentity, token: number): boolean {
+    return (
+      intakeGeneration.current.isCurrent(token) &&
+      summaryRequestId.current === identity.requestId &&
+      approvalRef.current?.reviewSha256 === identity.reviewSha256 &&
+      approvedReviewKeyRef.current === identity.reviewSha256 &&
+      reviewKeyRef.current === identity.reviewSha256
+    );
+  }
+
+  async function requireCurrentApproval(message: string): Promise<{
+    approval: ReviewApproval;
+    input: ReviewedRepresentation;
+    snapshot: ReviewSnapshot;
+  } | null> {
+    const snapshot = currentReview.current;
+    const computationId = reviewComputationId.current;
+    const currentApproval = approvalRef.current;
+    const currentKey = reviewKeyRef.current;
+    if (
+      !snapshot.extracted ||
+      !currentApproval ||
+      !currentKey ||
+      approvedReviewKeyRef.current !== currentKey ||
+      currentApproval.reviewSha256 !== currentKey
+    ) {
+      setReportError(message);
+      return null;
+    }
+
+    const input = await reviewedRepresentation(snapshot);
+    if (
+      !input ||
+      computationId !== reviewComputationId.current ||
+      !sameReviewSnapshot(snapshot, currentReview.current) ||
+      approvalRef.current !== currentApproval ||
+      reviewKeyRef.current !== currentKey
+    ) {
+      setReportError(message);
+      return null;
+    }
+    const isCurrent = await reviewIsCurrent(currentApproval, input);
+    if (
+      !isCurrent ||
+      computationId !== reviewComputationId.current ||
+      !sameReviewSnapshot(snapshot, currentReview.current) ||
+      approvalRef.current !== currentApproval ||
+      approvedReviewKeyRef.current !== currentKey ||
+      reviewKeyRef.current !== currentKey
+    ) {
+      setReportError(message);
+      return null;
+    }
+    return { approval: currentApproval, input, snapshot };
+  }
+
+  async function approveCurrentReview() {
+    const snapshot = currentReview.current;
+    const expectedKey = reviewKeyRef.current;
+    const computationId = reviewComputationId.current;
+    const requestId = ++approvalRequestId.current;
+    if (!snapshot.extracted || !expectedKey) {
+      setReportError("Wait for Harbor to finish preparing the redaction review.");
+      return;
+    }
+    setApprovalBusy(true);
+    setReportError(null);
+    try {
+      const input = await reviewedRepresentation(snapshot);
+      if (
+        !input ||
+        requestId !== approvalRequestId.current ||
+        computationId !== reviewComputationId.current ||
+        !sameReviewSnapshot(snapshot, currentReview.current) ||
+        reviewKeyRef.current !== expectedKey
+      ) {
+        return;
+      }
+      const nextApproval = await approveReview(input);
+      if (
+        requestId !== approvalRequestId.current ||
+        computationId !== reviewComputationId.current ||
+        !sameReviewSnapshot(snapshot, currentReview.current) ||
+        reviewKeyRef.current !== expectedKey ||
+        nextApproval.reviewSha256 !== expectedKey
+      ) {
+        return;
+      }
+      approvalRef.current = nextApproval;
+      approvedReviewKeyRef.current = expectedKey;
+      setApproval(nextApproval);
+      setApprovedReviewKey(expectedKey);
+    } catch (err) {
+      if (requestId === approvalRequestId.current) {
+        setReportError(err instanceof Error ? err.message : "Could not approve this review.");
+      }
+    } finally {
+      if (requestId === approvalRequestId.current) setApprovalBusy(false);
+    }
+  }
+
+  function clearDerivedState() {
+    invalidateReview();
+    setExtracted(null);
+    setSpans([]);
+    setOpenMedSpans([]);
+    setDetectors([]);
+    setOpenmedNote("");
+  }
+
   async function requestReportText(
-    doc: ExtractedDocument,
-    nextSpans: PhiSpan[],
+    input: ReviewedRepresentation,
+    approval: ReviewApproval,
     token: number,
+    identity: SummaryIdentity,
   ): Promise<string | null> {
-    const text = prepareModelInput(redactText(doc.text, nextSpans, "keep").redacted);
     const serverResult = await generateServerReport({
       data: {
-        redactedText: text,
+        redactedText: input.redactedText,
+        redactedSha256: approval.redactedSha256,
+        dateMode: input.dateMode,
         model: config?.configured
           ? config.models.includes(model)
             ? model
@@ -146,7 +371,7 @@ export function HarborApp() {
           : "",
       },
     });
-    if (!intakeGeneration.current.isCurrent(token)) return null;
+    if (!summaryIsCurrent(identity, token)) return null;
     if (serverResult.ok) return serverResult.text;
 
     const missingSecrets = /OPENROUTER_API_KEY and OPENROUTER_MODEL/.test(serverResult.error);
@@ -161,9 +386,9 @@ export function HarborApp() {
     const textOut = await summarizeWithOpenRouter({
       apiKey,
       model,
-      redactedText: text,
+      redactedText: prepareModelInput(input.redactedText),
     });
-    if (!intakeGeneration.current.isCurrent(token)) return null;
+    if (!summaryIsCurrent(identity, token)) return null;
     return textOut;
   }
 
@@ -250,10 +475,19 @@ export function HarborApp() {
     setError(null);
   }
 
-  function exportFiles() {
-    if (!extracted) return;
-    const payload = buildExport({ extracted, spans, dateMode, detectors, report });
-    const base = extracted.fileName.replace(/\.(pdf|docx)$/i, "") + "-deidentified";
+  async function exportFiles() {
+    const context = await requireCurrentApproval(
+      "Review and approve the redactions before downloading the artifact.",
+    );
+    if (!context?.snapshot.extracted) return;
+    const payload = buildExport({
+      extracted: context.snapshot.extracted,
+      spans: context.snapshot.spans,
+      dateMode: context.snapshot.dateMode,
+      detectors,
+      report,
+    });
+    const base = context.snapshot.extracted.fileName.replace(/\.(pdf|docx)$/i, "") + "-deidentified";
     downloadTextFile(`${base}.md`, payload.markdown, "text/markdown");
     downloadTextFile(`${base}.json`, JSON.stringify(payload.json, null, 2), "application/json");
   }
@@ -270,24 +504,49 @@ export function HarborApp() {
     window.setTimeout(() => setCopied(null), 1400);
   }
 
-  async function createReport(
-    doc = extracted,
-    nextSpans = spans,
-  ) {
-    if (!doc) return;
+  async function createReport() {
+    const context = await requireCurrentApproval(
+      "Review and approve the redactions before creating a summary.",
+    );
+    if (!context) return;
     const token = intakeGeneration.current.current();
+    const identity = {
+      requestId: ++summaryRequestId.current,
+      reviewSha256: context.approval.reviewSha256,
+    };
     setReportBusy(true);
     setReportError(null);
     try {
-      const textOut = await requestReportText(doc, nextSpans, token);
-      if (!intakeGeneration.current.isCurrent(token)) return;
+      const textOut = await requestReportText(
+        context.input,
+        context.approval,
+        token,
+        identity,
+      );
+      if (!summaryIsCurrent(identity, token)) return;
       if (!textOut) return;
       setReport(textOut);
     } catch (err) {
-      if (!intakeGeneration.current.isCurrent(token)) return;
+      if (!summaryIsCurrent(identity, token)) return;
       setReportError(err instanceof Error ? err.message : "Report failed.");
     } finally {
-      if (intakeGeneration.current.isCurrent(token)) setReportBusy(false);
+      if (summaryIsCurrent(identity, token)) setReportBusy(false);
+    }
+  }
+
+  async function copyApproved(label: "report" | "clean", value: string) {
+    const context = await requireCurrentApproval(
+      `Review and approve the redactions before copying ${label === "clean" ? "clean text" : "the summary"}.`,
+    );
+    if (!context) return;
+    const reviewSha256 = context.approval.reviewSha256;
+    await copy(label, value);
+    if (
+      approvalRef.current?.reviewSha256 !== reviewSha256 ||
+      approvedReviewKeyRef.current !== reviewSha256 ||
+      reviewKeyRef.current !== reviewSha256
+    ) {
+      setCopied(null);
     }
   }
 
@@ -310,7 +569,7 @@ export function HarborApp() {
             </h1>
             <p className="mt-3 max-w-prose text-sm leading-relaxed text-muted sm:text-base">
               {mode === "simple"
-                ? "Drop a PDF or DOCX, review the highlights, then choose whether to create and download a report."
+                ? "Add a PDF or DOCX, review the highlights, approve the redactions, then optionally create a summary or download."
                 : "Full controls: known identity, date handling, findings, and OpenRouter when no server secret is set."}
             </p>
           </div>
@@ -326,11 +585,12 @@ export function HarborApp() {
         </header>
 
         {mode === "simple" ? (
-          <ul className="grid gap-3 sm:grid-cols-3">
+          <ul className="grid gap-3 sm:grid-cols-4">
             {[
               { icon: Shield, title: "1. Add a file", body: "PDF or DOCX stays in this tab." },
               { icon: Cpu, title: "2. Check highlights", body: "OpenMed first, then you edit." },
-              { icon: Check, title: "3. Report", body: "Select Create report, then download or copy it." },
+              { icon: Check, title: "3. Approve", body: "Approve this exact redacted view." },
+              { icon: Check, title: "4. Optional", body: "Create a summary or download." },
             ].map((item) => (
               <li key={item.title} className="flex gap-3 rounded-lg border border-line bg-paper px-4 py-3">
                 <item.icon className="mt-0.5 size-4 shrink-0 text-accent" />
@@ -452,7 +712,7 @@ export function HarborApp() {
               <p className="text-xs leading-relaxed text-muted">{openmedNote}</p>
               {mode === "complex" ? (
                 <>
-                  <DateModePicker dateMode={dateMode} onChange={setDateMode} />
+                  <DateModePicker dateMode={dateMode} onChange={setReviewedDateMode} />
                   <details className="rounded-md border border-line bg-bg px-3 py-2">
                     <summary className="cursor-pointer text-sm font-medium">Known identity</summary>
                     <div className="mt-3">
@@ -463,7 +723,7 @@ export function HarborApp() {
                         size="sm"
                         onClick={() => {
                           if (!extracted) return;
-                          setSpans(supplementWithLocalPhi(extracted.text, openMedSpans, seed));
+                          setReviewedSpans(supplementWithLocalPhi(extracted.text, openMedSpans, seed));
                         }}
                       >
                         Rescan with identity
@@ -473,7 +733,7 @@ export function HarborApp() {
                   <details className="rounded-md border border-line bg-bg px-3 py-2">
                     <summary className="cursor-pointer text-sm font-medium">Findings ({spans.length})</summary>
                     <div className="mt-3">
-                      <FindingsList spans={spans} setSpans={setSpans} />
+                      <FindingsList spans={spans} setSpans={setReviewedSpans} />
                     </div>
                   </details>
                   {extracted.extractors?.length ? (
@@ -484,16 +744,20 @@ export function HarborApp() {
               <ReportPanel
                 config={config}
                 mode={mode}
+                dateMode={dateMode}
+                reviewApproved={reviewApproved}
+                approvalBusy={approvalBusy}
                 report={report}
                 reportBusy={reportBusy}
                 reportError={reportError}
                 copied={copied}
+                onApprove={() => void approveCurrentReview()}
                 onCreate={() => void createReport()}
                 onCopyReport={() => {
-                  if (report) void copy("report", report);
+                  if (report) void copyApproved("report", report);
                 }}
-                onCopyClean={() => void copy("clean", redacted)}
-                onDownload={exportFiles}
+                onCopyClean={() => void copyApproved("clean", redacted)}
+                onDownload={() => void exportFiles()}
                 showKeyFields={showKeyFields}
                 apiKey={apiKey}
                 setApiKey={setApiKey}
@@ -535,7 +799,7 @@ export function HarborApp() {
                   {redacted}
                 </pre>
               ) : (
-                <RedactDoc text={extracted.text} spans={spans} onChange={setSpans} />
+                <RedactDoc text={extracted.text} spans={spans} onChange={setReviewedSpans} />
               )}
               <p className="mt-3 text-xs leading-relaxed text-subtle">
                 Detectors: {detectors.join(", ") || "none"}. Harbor is a de-identification aid, not a HIPAA

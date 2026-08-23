@@ -10,6 +10,7 @@ import {
 import { cn } from "@/lib/utils";
 import type { OpenRouterModel } from "@/lib/openrouter";
 import type { ReportConfig } from "@/lib/openrouter-env";
+import { describeOpenRouterDateDisclosure } from "@/lib/phi/review";
 
 export const DATE_MODES: { id: DateMode; label: string; hint: string }[] = [
   { id: "relative", label: "Relative", hint: "Day 0, Day +N" },
@@ -199,10 +200,14 @@ export function ExtractorCompare({
 export function ReportPanel({
   config,
   mode,
+  dateMode,
+  reviewApproved,
+  approvalBusy,
   report,
   reportBusy,
   reportError,
   copied,
+  onApprove,
   onCreate,
   onCopyReport,
   onCopyClean,
@@ -218,10 +223,14 @@ export function ReportPanel({
 }: {
   config: ReportConfig | null;
   mode: "simple" | "complex";
+  dateMode: DateMode;
+  reviewApproved: boolean;
+  approvalBusy: boolean;
   report: string | null;
   reportBusy: boolean;
   reportError: string | null;
   copied: string | null;
+  onApprove: () => void;
   onCreate: () => void;
   onCopyReport: () => void;
   onCopyClean: () => void;
@@ -240,9 +249,8 @@ export function ReportPanel({
       {config?.configured ? (
         <div className="grid gap-2">
           <p className="text-xs leading-relaxed text-muted">
-            Report uses {config.models.includes(model) ? model : config.model} from `.env` / Fly. The key stays on
-            the server. Names stay redacted; clinical dates are sent so the summary can follow the chart. There is no
-            24k-character cutoff.
+            Summary uses {config.models.includes(model) ? model : config.model} from `.env` / Fly. The key stays on
+            the server. Names stay redacted. There is no 24k-character cutoff.
           </p>
           {config.models.length > 1 ? (
             <label className="grid gap-1 text-xs font-medium text-muted">
@@ -264,11 +272,14 @@ export function ReportPanel({
         </div>
       ) : mode === "simple" ? (
         <p className="text-xs leading-relaxed text-muted">
-          Creating a report requires OPENROUTER_API_KEY and OPENROUTER_MODEL or OPENROUTER_MODEL_1 in `.env` or Fly
-          secrets. Review the redacted text, then select Create report. Switch to Complex to paste a key for this
-          browser only.
+          Creating a summary requires OPENROUTER_API_KEY and OPENROUTER_MODEL or OPENROUTER_MODEL_1 in `.env` or Fly
+          secrets. Review and approve the redacted text first. Switch to Complex to paste a key for this browser only.
         </p>
       ) : null}
+
+      <p data-testid="summary-date-disclosure" className="text-xs leading-relaxed text-muted">
+        {describeOpenRouterDateDisclosure(dateMode)}
+      </p>
 
       {showKeyFields ? (
         <div className="grid gap-2">
@@ -317,9 +328,32 @@ export function ReportPanel({
         </div>
       ) : null}
 
-      <Button onClick={onCreate} disabled={reportBusy}>
+      <div
+        data-testid="review-status"
+        className={cn(
+          "rounded-sm border px-3 py-2 text-xs leading-relaxed",
+          reviewApproved
+            ? "border-accent/30 bg-accent-soft text-accent"
+            : "border-line bg-bg text-muted",
+        )}
+      >
+        {reviewApproved
+          ? "Approved for this exact redacted text, finding set, and date policy."
+          : "Not approved. Review the redacted view before summary, copy, or download."}
+      </div>
+      <Button
+        data-testid="approve-redactions"
+        variant="secondary"
+        onClick={onApprove}
+        disabled={approvalBusy || reviewApproved}
+      >
+        {approvalBusy ? <Loader2 className="size-4 animate-spin" /> : <Check className="size-4" />}
+        {reviewApproved ? "Redactions approved" : "Approve redactions"}
+      </Button>
+
+      <Button data-testid="create-summary" onClick={onCreate} disabled={reportBusy || !reviewApproved}>
         {reportBusy ? <Loader2 className="size-4 animate-spin" /> : null}
-        {report ? "Update report" : "Create report"}
+        {report ? "Update summary" : "Create summary"}
       </Button>
       {reportError ? <p className="text-xs leading-relaxed text-phi">{reportError}</p> : null}
       {report ? (
@@ -330,15 +364,15 @@ export function ReportPanel({
           {report}
         </pre>
       ) : null}
-      <Button variant="secondary" onClick={onDownload}>
+      <Button data-testid="download-artifact" variant="secondary" onClick={onDownload} disabled={!reviewApproved}>
         <Download className="size-4" />
         Download
       </Button>
-      <Button variant="secondary" onClick={onCopyReport} disabled={!report}>
+      <Button variant="secondary" onClick={onCopyReport} disabled={!report || !reviewApproved}>
         {copied === "report" ? <Check className="size-4" /> : <Copy className="size-4" />}
-        {copied === "report" ? "Copied report" : "Copy report"}
+        {copied === "report" ? "Copied summary" : "Copy summary"}
       </Button>
-      <Button variant="ghost" onClick={onCopyClean}>
+      <Button variant="ghost" onClick={onCopyClean} disabled={!reviewApproved}>
         {copied === "clean" ? <Check className="size-4" /> : <Copy className="size-4" />}
         {copied === "clean" ? "Copied clean text" : "Copy clean text"}
       </Button>
