@@ -1,19 +1,85 @@
-import { normalizeLabel, type CanonicalLabel, type TokenClassificationPipeline, type TransformersRuntime } from "openmed";
+import type { CanonicalLabel, TokenClassificationPipeline, TransformersRuntime } from "openmed";
 import { mergeSpans } from "./merge.ts";
 import type { DetectorSource, PhiCategory, PhiSpan } from "./types.ts";
 
 export const OPENMED_MODEL = "OpenMed/OpenMed-PII-ClinicalE5-Small-33M-v1-onnx-android";
+export const OPENMED_MODEL_REVISION = "79f7db205869b1be4be23ac4f42aa95bdedc5aee";
+export const OPENMED_RUNTIME_VERSION = "2.1.0";
+export const DETERMINISTIC_RULESET_VERSION = "harbor-rules-v1";
 const CACHE_KEY = "transformers-cache";
 
 export type OpenMedDevice = "webgpu" | "wasm";
 
+export type OpenMedAttempt = {
+  device: OpenMedDevice;
+  variant: "fp16" | "int8";
+};
+
+export type OpenMedRuntimeState = {
+  status: "ready" | "degraded";
+  device: OpenMedDevice | null;
+  variant: OpenMedAttempt["variant"] | null;
+  model: string;
+  revision: string;
+};
+
 type LoadedEngine = {
   pipeline: TokenClassificationPipeline;
   device: OpenMedDevice;
+  variant: OpenMedAttempt["variant"];
+  model: string;
+  revision: string;
+  normalizeLabel: (label: string) => CanonicalLabel;
 };
 
 let engine: LoadedEngine | null = null;
 let loading: Promise<LoadedEngine> | null = null;
+let runtime: OpenMedRuntimeState = {
+  status: "degraded",
+  device: null,
+  variant: null,
+  model: OPENMED_MODEL,
+  revision: OPENMED_MODEL_REVISION,
+};
+
+export function getOpenMedRuntimeState(): OpenMedRuntimeState {
+  return { ...runtime };
+}
+
+export function openMedAttempts(hasWebGpu: boolean): OpenMedAttempt[] {
+  return hasWebGpu
+    ? [
+        { device: "webgpu", variant: "fp16" },
+        { device: "wasm", variant: "int8" },
+      ]
+    : [{ device: "wasm", variant: "int8" }];
+}
+
+export async function runOpenMedAttempts<T>(
+  hasWebGpu: boolean,
+  loadAttempt: (attempt: OpenMedAttempt) => Promise<T>,
+  onProgress?: (message: string) => void,
+): Promise<T> {
+  const attempts = openMedAttempts(hasWebGpu);
+  let finalFailure: unknown;
+
+  for (const [index, attempt] of attempts.entries()) {
+    try {
+      return await loadAttempt(attempt);
+    } catch (error) {
+      finalFailure = error;
+      if (index < attempts.length - 1) {
+        onProgress?.("WebGPU unavailable. Trying OpenMed on WASM…");
+      } else {
+        onProgress?.(
+          "OpenMed unavailable. Harbor is continuing in deterministic-only degraded mode.",
+        );
+      }
+    }
+  }
+
+  throw finalFailure;
+}
 
 const LABEL_TO_CATEGORY: Partial<Record<CanonicalLabel, PhiCategory>> = {
   ACCOUNT_NUMBER: "account",
@@ -140,9 +206,9 @@ export async function loadOpenMed(onProgress?: (message: string) => void): Promi
     const { transformers, progress } = await configureHub(onProgress ?? (() => undefined));
     const openmed = await import("openmed");
 
-    const tryLoad = async (device: OpenMedDevice, variant: "fp16" | "int8") => {
+    const tryLoad = async (attempt: OpenMedAttempt): Promise<LoadedEngine> => {
       onProgress?.(
-        device === "webgpu"
+        attempt.device === "webgpu"
           ? cached
             ? "Starting OpenMed on WebGPU…"
             : "Downloading the WebGPU OpenMed weights…"
@@ -151,9 +217,9 @@ export async function loadOpenMed(onProgress?: (message: string) => void): Promi
             : "Downloading the WASM OpenMed weights…",
       );
       const pipeline = await openmed.loadOnnxModel(OPENMED_MODEL, {
-        variant,
-        device: device === "webgpu" ? "webgpu" : "wasm",
-        dtype: variant === "fp16" ? "fp16" : "int8",
+        variant: attempt.variant,
+        device: attempt.device,
+        revision: OPENMED_MODEL_REVISION,
         allowRemoteModels: true,
         localFilesOnly: false,
         runtime: {
@@ -163,21 +229,46 @@ export async function loadOpenMed(onProgress?: (message: string) => void): Promi
         },
         pipelineOptions: {
           progress_callback: progress,
-          model_file_name: "model",
-          dtype: variant === "fp16" ? "fp16" : "int8",
           subfolder: "",
         },
       });
-      return { pipeline, device };
+      return {
+        pipeline,
+        device: attempt.device,
+        variant: attempt.variant,
+        model: OPENMED_MODEL,
+        revision: OPENMED_MODEL_REVISION,
+        normalizeLabel: openmed.normalizeLabel,
+      };
     };
 
     try {
-      engine = await tryLoad("wasm", "int8");
-      onProgress?.("OpenMed ready on WASM. Weights stay in this browser.");
+      engine = await runOpenMedAttempts(
+        webGpuAvailable(),
+        tryLoad,
+        onProgress,
+      );
+      runtime = {
+        status: "ready",
+        device: engine.device,
+        variant: engine.variant,
+        model: engine.model,
+        revision: engine.revision,
+      };
+      onProgress?.(
+        `OpenMed ready on ${engine.device === "webgpu" ? "WebGPU" : "WASM"}. Weights stay in this browser.`,
+      );
       return engine;
     } catch (error) {
+      runtime = {
+        status: "degraded",
+        device: null,
+        variant: null,
+        model: OPENMED_MODEL,
+        revision: OPENMED_MODEL_REVISION,
+      };
       loading = null;
-      throw new Error(error instanceof Error ? error.message : "OpenMed failed to load");
+      throw error instanceof Error ? error : new Error("OpenMed failed to load");
     }
   })();
 
@@ -237,7 +328,10 @@ const EXTRA_LABELS: Record<string, CanonicalLabel> = {
   doctor: "PERSON",
 };
 
-function canonicalFromGroup(label: string): CanonicalLabel {
+function canonicalFromGroup(
+  label: string,
+  normalizeLabel: (value: string) => CanonicalLabel,
+): CanonicalLabel {
   const cleaned = label.replace(/^[BIES]-/i, "");
   const canonical = normalizeLabel(cleaned);
   if (canonical !== "OTHER") return canonical;
@@ -266,16 +360,6 @@ function flattenPipelineOutput(output: unknown): PipelineEntity[] {
   return [];
 }
 
-function describePipelineOutput(output: unknown): string {
-  if (output == null) return "null";
-  if (Array.isArray(output)) {
-    const first = output[0] as { entity?: string; entity_group?: string; start?: number } | undefined;
-    return `array(${output.length}) first=${first ? JSON.stringify(first).slice(0, 180) : "empty"}`;
-  }
-  if (typeof output === "object") return `object keys=${Object.keys(output as object).join(",")}`;
-  return typeof output;
-}
-
 export async function scanWithOpenMed(args: {
   text: string;
   windows?: { start: number; text: string }[];
@@ -285,7 +369,6 @@ export async function scanWithOpenMed(args: {
   const windows = args.windows ?? chunkText(args.text);
   const found: PhiSpan[] = [];
   let rawCount = 0;
-  let debug = "";
   let i = 0;
   for (const window of windows) {
     i += 1;
@@ -296,10 +379,6 @@ export async function scanWithOpenMed(args: {
     });
     const entities = flattenPipelineOutput(output);
     rawCount += entities.length;
-    if (entities.length === 0 && i === 1) {
-      const raw = await loaded.pipeline(window.text.slice(0, 240), { ignore_labels: [] });
-      debug = describePipelineOutput(raw);
-    }
     let cursor = 0;
     entities.forEach((entity, index) => {
       let start = Number(entity.start);
@@ -314,7 +393,10 @@ export async function scanWithOpenMed(args: {
         cursor = Math.max(cursor, end);
       }
       const mapped = toPhiSpan({
-        canonical: canonicalFromGroup(entity.entity_group ?? entity.entity ?? ""),
+        canonical: canonicalFromGroup(
+          entity.entity_group ?? entity.entity ?? "",
+          loaded.normalizeLabel,
+        ),
         start,
         end,
         score: entity.score ?? null,
