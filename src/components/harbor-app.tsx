@@ -135,12 +135,10 @@ export function HarborApp() {
   }
 
   async function requestReportText(
-    automatic: boolean,
     doc: ExtractedDocument,
     nextSpans: PhiSpan[],
     token: number,
   ): Promise<string | null> {
-    if (automatic && autoReportFor.current === reportFingerprint) return null;
     const text = prepareModelInput(redactText(doc.text, nextSpans, "keep").redacted);
     const serverResult = await generateServerReport({
       data: {
@@ -156,7 +154,6 @@ export function HarborApp() {
     if (serverResult.ok) return serverResult.text;
 
     const missingSecrets = /OPENROUTER_API_KEY and OPENROUTER_MODEL/.test(serverResult.error);
-    if (automatic && missingSecrets) return null;
     if (!missingSecrets) throw new Error(serverResult.error);
     if (!apiKey.trim() || !model.trim()) {
       throw new Error(
@@ -187,10 +184,6 @@ export function HarborApp() {
         nextOpenMed.length > 0
           ? supplementWithLocalPhi(document.text, nextOpenMed, seed)
           : detectLocalPhi(document.text, seed),
-      createReport:
-        mode === "simple"
-          ? (document, nextSpans, token) => requestReportText(true, document, nextSpans, token)
-          : undefined,
       callbacks: {
         onClear: clearDerivedState,
         onWorking: () => {
@@ -208,7 +201,11 @@ export function HarborApp() {
           setDetectors(used);
           setDocView("redacted");
           setStage("review");
-          if (nextOpenMed.length > 0) setError(null);
+          if (document.warnings?.length) {
+            setError(`Document extraction warning: ${document.warnings.join(" ")} Review the extract carefully.`);
+          } else if (nextOpenMed.length > 0) {
+            setError(null);
+          }
         },
         onReportBusy: setReportBusy,
         onReport: (nextReport) => {
@@ -289,7 +286,7 @@ export function HarborApp() {
     setReportBusy(true);
     setReportError(null);
     try {
-      const textOut = await requestReportText(false, doc, nextSpans, token);
+      const textOut = await requestReportText(doc, nextSpans, token);
       if (!intakeGeneration.current.isCurrent(token)) return;
       if (!textOut) return;
       setReport(textOut);

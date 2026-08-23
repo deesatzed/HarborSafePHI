@@ -24,12 +24,15 @@ test("Harbor accepts PDF and DOCX through a local document extractor", () => {
   assert.match(app, /setReportBusy\(false\)/);
   assert.match(app, /"harbor-hydrated"/);
   assert.match(app, /data-testid="document-input"/);
+  assert.doesNotMatch(app, /createReport:\s*mode === "simple"/);
   assert.match(extractor, /import\("mammoth"\)/);
   assert.doesNotMatch(extractor, /mammoth\/mammoth\.browser/);
   assert.match(extractor, /MAX_DOCUMENT_BYTES/);
+  assert.match(extractor, /MAX_EXTRACTED_CHARACTERS/);
+  assert.match(extractor, /MAX_DOCX_UNCOMPRESSED_BYTES/);
   assert.match(extractor, /MIN_DOCUMENT_TEXT_CHARACTERS/);
   assert.match(types, /export type ExtractedDocument/);
-  assert.match(types, /kind: "pdf" \| "docx"/);
-  assert.match(types, /pageCount: number \| null/);
+  assert.match(types, /kind: "pdf";[\s\S]*pageCount: number/);
+  assert.match(types, /kind: "docx";[\s\S]*pageCount: null/);
   assert.equal(typeof pkg.dependencies.mammoth, "string");
 });

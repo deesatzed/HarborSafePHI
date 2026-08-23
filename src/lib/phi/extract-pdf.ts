@@ -1,4 +1,4 @@
-import type { ExtractedDocument } from "./types.ts";
+import type { ExtractedPdf } from "./types.ts";
 import {
   joinPageTexts,
   reconstructPageText,
@@ -31,7 +31,7 @@ function spansFromContent(items: PdfJsTextItem[]): PdfTextSpan[] {
   return spans;
 }
 
-export async function extractPdfText(file: File): Promise<ExtractedDocument> {
+export async function extractPdfText(file: File): Promise<ExtractedPdf> {
   const pdfjs = await import("pdfjs-dist");
   const workerUrl = (await import("pdfjs-dist/build/pdf.worker.min.mjs?url")).default;
   pdfjs.GlobalWorkerOptions.workerSrc = workerUrl;

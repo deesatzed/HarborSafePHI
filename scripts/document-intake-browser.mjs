@@ -6,8 +6,9 @@ const url = process.argv[2] ?? "http://127.0.0.1:8081/";
 const timeout = 45_000;
 const fileName = "synthetic-intake.docx";
 const marker = "Synthetic browser document contains enough neutral words for local intake proof and review.";
+const unreadableFileName = "synthetic-unreadable.docx";
 
-async function syntheticDocx() {
+async function syntheticDocx(text = marker) {
   const zip = new JSZip();
   zip.file(
     "[Content_Types].xml",
@@ -19,9 +20,31 @@ async function syntheticDocx() {
   );
   zip.folder("word").file(
     "document.xml",
-    `<?xml version="1.0" encoding="UTF-8"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>${marker}</w:t></w:r></w:p><w:sectPr/></w:body></w:document>`,
+    `<?xml version="1.0" encoding="UTF-8"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>${text}</w:t></w:r></w:p><w:sectPr/></w:body></w:document>`,
   );
   return zip.generateAsync({ type: "nodebuffer" });
+}
+
+function networkAudit(page, sensitiveValues) {
+  const appOrigin = new URL(url).origin;
+  const state = { enabled: false, modelRequests: 0, summaryRequests: 0, sameOriginMutations: 0, sensitiveEgress: 0 };
+  page.on("request", (request) => {
+    if (!state.enabled) return;
+    const requestUrl = request.url();
+    const method = request.method();
+    const body = request.postDataBuffer();
+    if (/huggingface\.co|cdn-lfs|hf\.co/.test(requestUrl)) state.modelRequests += 1;
+    if (method === "POST" && requestUrl.includes("/api/v1/chat/completions")) state.summaryRequests += 1;
+    if (new URL(requestUrl).origin === appOrigin && !["GET", "HEAD", "OPTIONS"].includes(method)) {
+      state.sameOriginMutations += 1;
+    }
+    if (new URL(requestUrl).origin !== appOrigin && body) {
+      const bodyText = body.toString("utf8");
+      const hasZipSignature = body.includes(Buffer.from([0x50, 0x4b, 0x03, 0x04]));
+      if (hasZipSignature || sensitiveValues.some((value) => bodyText.includes(value))) state.sensitiveEgress += 1;
+    }
+  });
+  return state;
 }
 
 let browser;
@@ -29,16 +52,11 @@ try {
   browser = await chromium.launch({ headless: true, args: ["--no-sandbox", "--disable-dev-shm-usage"] });
   const page = await browser.newPage();
   const errors = [];
-  let openRouterRequests = 0;
+  const audit = networkAudit(page, [fileName, marker]);
   page.on("console", (message) => {
     if (message.type() === "error") errors.push(message.text());
   });
   page.on("pageerror", (error) => errors.push(error.message));
-  page.on("request", (request) => {
-    if (request.method() === "POST" && request.url().includes("/api/v1/chat/completions")) {
-      openRouterRequests += 1;
-    }
-  });
   await page.route("**/*", async (route) => {
     const requestUrl = route.request().url();
     if (/huggingface\.co|cdn-lfs|hf\.co/.test(requestUrl)) return route.abort("blockedbyclient");
@@ -47,6 +65,7 @@ try {
   await page.goto(url, { waitUntil: "domcontentloaded", timeout });
   await page.locator('[data-testid="harbor-hydrated"]').waitFor({ state: "visible", timeout });
   await page.getByRole("button", { name: "complex", exact: true }).click();
+  audit.enabled = true;
   await page.locator('[data-testid="document-input"]').setInputFiles({
     name: fileName,
     mimeType: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
@@ -54,12 +73,40 @@ try {
   });
   await page.getByText(fileName, { exact: true }).waitFor({ state: "visible", timeout });
   await page.locator('[data-testid="redacted"]').getByText(marker, { exact: false }).waitFor({ state: "visible", timeout });
-  if (openRouterRequests !== 0) throw new Error(`unexpected OpenRouter requests: ${openRouterRequests}`);
+  if (audit.summaryRequests || audit.sameOriginMutations || audit.sensitiveEgress) {
+    throw new Error(`valid DOCX crossed a report/egress boundary: ${JSON.stringify(audit)}`);
+  }
   const unexpectedErrors = errors.filter(
     (message) => !/Failed to load resource|ERR_BLOCKED_BY_CLIENT/.test(message),
   );
   if (unexpectedErrors.length > 0) throw new Error(`browser errors: ${unexpectedErrors.join(" | ")}`);
-  console.log(JSON.stringify({ ok: true, fileName, markerVisible: true, openRouterRequests }, null, 2));
+
+  const unreadablePage = await browser.newPage();
+  const unreadableAudit = networkAudit(unreadablePage, [unreadableFileName, "short"]);
+  await unreadablePage.route("**/*", async (route) => {
+    const requestUrl = route.request().url();
+    if (/huggingface\.co|cdn-lfs|hf\.co/.test(requestUrl)) return route.abort("blockedbyclient");
+    return route.continue();
+  });
+  await unreadablePage.goto(url, { waitUntil: "domcontentloaded", timeout });
+  await unreadablePage.locator('[data-testid="harbor-hydrated"]').waitFor({ state: "visible", timeout });
+  await unreadablePage.getByRole("button", { name: "complex", exact: true }).click();
+  unreadableAudit.enabled = true;
+  await unreadablePage.locator('[data-testid="document-input"]').setInputFiles({
+    name: unreadableFileName,
+    mimeType: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    buffer: await syntheticDocx("short"),
+  });
+  await unreadablePage.getByText(/too little readable text/i).waitFor({ state: "visible", timeout });
+  if (
+    unreadableAudit.modelRequests ||
+    unreadableAudit.summaryRequests ||
+    unreadableAudit.sameOriginMutations ||
+    unreadableAudit.sensitiveEgress
+  ) {
+    throw new Error(`unreadable DOCX crossed a model/report/egress boundary: ${JSON.stringify(unreadableAudit)}`);
+  }
+  console.log(JSON.stringify({ ok: true, fileName, markerVisible: true, audit, unreadableAudit }, null, 2));
 } catch (error) {
   console.error(JSON.stringify({ ok: false, error: String(error?.message ?? error) }, null, 2));
   process.exitCode = 1;

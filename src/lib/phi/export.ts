@@ -1,6 +1,6 @@
 import { countByCategory } from "./detect.ts";
 import { redactText } from "./redact.ts";
-import type { DateMode, ExtractedPdf, PhiSpan } from "./types.ts";
+import type { DateMode, ExtractedDocument, PhiSpan } from "./types.ts";
 
 export type HarborExport = {
   schema: "harbor-clinical-extract-v1";
@@ -19,7 +19,7 @@ export type HarborExport = {
 };
 
 export function buildExport(args: {
-  extracted: ExtractedPdf;
+  extracted: ExtractedDocument;
   spans: PhiSpan[];
   dateMode: DateMode;
   detectors: string[];
@@ -61,7 +61,7 @@ export function buildExport(args: {
     }`,
     `Date mode: ${args.dateMode}${redaction.originIso ? ` · index ${redaction.originIso}` : ""}`,
     `Findings accepted: ${redaction.acceptedCount} / ${args.spans.length}`,
-    `PDF text: ${args.extracted.extractor ?? "layout"}`,
+    `Text extraction: ${args.extracted.kind === "docx" ? "Mammoth" : (args.extracted.extractor ?? "layout")}`,
     ``,
     `## De-identified extract`,
     ``,

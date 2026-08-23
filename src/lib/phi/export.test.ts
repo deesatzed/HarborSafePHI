@@ -27,5 +27,7 @@ test("buildExport reports an unknown page count for DOCX without inventing pages
 
   assert.equal(result.json.source.pageCount, null);
   assert.match(result.markdown, /Source file: synthetic\.docx · Pages: Unknown/);
+  assert.match(result.markdown, /Text extraction: Mammoth/);
+  assert.doesNotMatch(result.markdown, /PDF text:/);
   assert.doesNotMatch(result.markdown, /null pages?/i);
 });
