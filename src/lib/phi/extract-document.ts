@@ -80,8 +80,12 @@ function safeDocxWarnings(messages: DocxMessage[]): string[] {
     }
     if (message.type !== "warning" || typeof message.message !== "string") continue;
     warningCount += 1;
-    if (warnings.length >= 8) continue;
-    const safe = message.message.replace(/\p{Cc}+/gu, " ").trim().slice(0, 240);
+    if (warningCount > 8) continue;
+    const safe = message.message
+      .slice(0, 1_024)
+      .replace(/\p{Cc}+/gu, " ")
+      .trim()
+      .slice(0, 240);
     if (safe) warnings.push(safe);
   }
   if (warningCount > 8) warnings.push(`${warningCount - 8} additional extraction warnings omitted.`);

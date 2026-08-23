@@ -330,7 +330,7 @@ export function HarborApp() {
             {[
               { icon: Shield, title: "1. Add a file", body: "PDF or DOCX stays in this tab." },
               { icon: Cpu, title: "2. Check highlights", body: "OpenMed first, then you edit." },
-              { icon: Check, title: "3. Report", body: "Download or copy when it lands." },
+              { icon: Check, title: "3. Report", body: "Select Create report, then download or copy it." },
             ].map((item) => (
               <li key={item.title} className="flex gap-3 rounded-lg border border-line bg-paper px-4 py-3">
                 <item.icon className="mt-0.5 size-4 shrink-0 text-accent" />
