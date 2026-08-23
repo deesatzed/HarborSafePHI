@@ -96,6 +96,7 @@ export function createOpenMedSession(initialize: OpenMedInitializer) {
   let engine: OpenMedEngine | null = null;
   let loading: Promise<OpenMedEngine> | null = null;
   let runtime = degradedRuntime();
+  let inferenceGeneration = 0;
   const progressSubscribers = new Set<(message: string) => void>();
 
   const broadcast = (message: string) => {
@@ -149,10 +150,11 @@ export function createOpenMedSession(initialize: OpenMedInitializer) {
     operation: (loaded: OpenMedEngine) => Promise<T>,
     onProgress?: (message: string) => void,
   ): Promise<T> => {
+    const generation = ++inferenceGeneration;
     const loaded = await load(onProgress);
     try {
       const result = await operation(loaded);
-      if (engine === loaded) {
+      if (generation === inferenceGeneration && engine === loaded) {
         runtime = {
           status: "ready",
           device: loaded.device,
@@ -167,9 +169,10 @@ export function createOpenMedSession(initialize: OpenMedInitializer) {
       );
       return result;
     } catch (error) {
-      if (engine === loaded) engine = null;
-      loading = null;
-      runtime = degradedRuntime();
+      if (generation === inferenceGeneration) {
+        if (engine === loaded) engine = null;
+        runtime = degradedRuntime();
+      }
       notify(onProgress, DEGRADED_MESSAGE);
       throw error instanceof Error ? error : new Error("OpenMed inference failed");
     }

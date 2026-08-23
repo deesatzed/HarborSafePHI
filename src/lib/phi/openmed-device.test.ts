@@ -18,6 +18,16 @@ function fakeEngine(pipeline: () => Promise<never[]> = async () => []) {
   };
 }
 
+function deferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+}
+
 test("WebGPU success does not try WASM", async () => {
   const seen: unknown[] = [];
   const result = await runOpenMedAttempts(true, async (attempt) => {
@@ -190,4 +200,81 @@ test("concurrent callers receive shared initialization progress", async () => {
 
   assert.deepEqual(firstMessages, ["Shared model progress"]);
   assert.deepEqual(secondMessages, ["Shared model progress"]);
+});
+
+test("stale failure after current success leaves runtime ready", async () => {
+  const stale = deferred<void>();
+  const current = deferred<void>();
+  const staleMessages: string[] = [];
+  const session = createOpenMedSession(async () => fakeEngine());
+  await session.load();
+
+  const staleRun = session.runInference(
+    async () => stale.promise,
+    (message) => staleMessages.push(message),
+  );
+  const staleRejected = assert.rejects(staleRun, /stale failed/);
+  const currentRun = session.runInference(async () => current.promise);
+
+  current.resolve();
+  await currentRun;
+  stale.reject(new Error("stale failed"));
+  await staleRejected;
+
+  assert.equal(session.getRuntimeState().status, "ready");
+  assert.deepEqual(staleMessages, [
+    "OpenMed engine loaded (wasm); starting local scan.",
+    "OpenMed unavailable. Harbor is continuing in deterministic-only degraded mode.",
+  ]);
+});
+
+test("stale success after current failure leaves runtime degraded", async () => {
+  const stale = deferred<void>();
+  const current = deferred<void>();
+  const session = createOpenMedSession(async () => fakeEngine());
+  await session.load();
+
+  const staleRun = session.runInference(async () => stale.promise);
+  const currentRun = session.runInference(async () => current.promise);
+  const currentRejected = assert.rejects(currentRun, /current failed/);
+
+  current.reject(new Error("current failed"));
+  await currentRejected;
+  stale.resolve();
+  await staleRun;
+
+  assert.equal(session.getRuntimeState().status, "degraded");
+});
+
+test("stale failure cannot clobber a newer in-flight initialization", async () => {
+  const stale = deferred<void>();
+  const current = deferred<void>();
+  const secondInitialization = deferred<void>();
+  let initializationCalls = 0;
+  const session = createOpenMedSession(async () => {
+    initializationCalls += 1;
+    if (initializationCalls === 2) await secondInitialization.promise;
+    return fakeEngine();
+  });
+  await session.load();
+
+  const staleRun = session.runInference(async () => stale.promise);
+  const staleRejected = assert.rejects(staleRun, /stale failed/);
+  const currentRun = session.runInference(async () => current.promise);
+  const currentRejected = assert.rejects(currentRun, /current failed/);
+
+  current.reject(new Error("current failed"));
+  await currentRejected;
+  const newLoad = session.load();
+  await Promise.resolve();
+  assert.equal(initializationCalls, 2);
+
+  stale.reject(new Error("stale failed"));
+  await staleRejected;
+  const overlappingLoad = session.load();
+  await Promise.resolve();
+  secondInitialization.resolve();
+  await Promise.all([newLoad, overlappingLoad]);
+
+  assert.equal(initializationCalls, 2);
 });
