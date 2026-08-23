@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import JSZip from "jszip";
 import {
   MAX_DOCUMENT_BYTES,
   MAX_DOCX_ENTRIES,
@@ -8,6 +9,7 @@ import {
   MIN_DOCUMENT_TEXT_CHARACTERS,
   documentKind,
   extractDocumentText,
+  inspectDocxArchive,
 } from "./extract-document.ts";
 import type { ExtractedDocument } from "./types.ts";
 
@@ -71,6 +73,24 @@ test("extractDocumentText retains safe Mammoth warnings and rejects fatal messag
     }),
     /could not be extracted completely/i,
   );
+});
+
+test("extractDocumentText bounds surfaced Mammoth warnings", async () => {
+  const file = new File([new Uint8Array([1])], "many-warnings.docx", {
+    type: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+  });
+  const result = await extractDocumentText(file, {
+    inspectDocx: async () => ({ entries: 3, totalUncompressedBytes: 100 }),
+    readDocx: async () => ({
+      value: "Synthetic document text long enough for review.",
+      messages: Array.from({ length: 12 }, (_, index) => ({
+        type: "warning",
+        message: `Warning ${index + 1}`,
+      })),
+    }),
+  });
+  assert.equal(result.warnings?.length, 9);
+  assert.equal(result.warnings?.at(-1), "4 additional extraction warnings omitted.");
 });
 
 test("extractDocumentText dispatches PDF files to the PDF extractor", async () => {
@@ -158,12 +178,31 @@ test("extractDocumentText rejects excessive extracted text before downstream pro
   const file = new File([new Uint8Array([1])], "long.docx", {
     type: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
   });
+  let normalizations = 0;
   await assert.rejects(
     () => extractDocumentText(file, {
       inspectDocx: async () => ({ entries: 3, totalUncompressedBytes: 100 }),
       readDocx: async () => ({ value: "x".repeat(MAX_EXTRACTED_CHARACTERS + 1), messages: [] }),
+      normalizeText: () => {
+        normalizations += 1;
+        return "must not run";
+      },
     }),
     /too much extracted text/i,
+  );
+  assert.equal(normalizations, 0);
+});
+
+test("real JSZip inspection fails closed on declared expansion", async () => {
+  const zip = new JSZip();
+  zip.file("word/document.xml", "x".repeat(100));
+  const buffer = await zip.generateAsync({ type: "arraybuffer" });
+  const summary = await inspectDocxArchive(buffer, { maxEntries: 10, maxUncompressedBytes: 1_000 });
+  assert.equal(summary.entries, 1);
+  assert.equal(summary.totalUncompressedBytes, 100);
+  await assert.rejects(
+    () => inspectDocxArchive(buffer, { maxEntries: 10, maxUncompressedBytes: 50 }),
+    /expands beyond Harbor's local limit/i,
   );
 });
 

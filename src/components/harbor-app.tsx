@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { AlertTriangle, Check, Cpu, FileUp, Loader2, Shield, Trash2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import {
@@ -75,7 +75,6 @@ export function HarborApp() {
   const [catalog, setCatalog] = useState<OpenRouterModel[]>([]);
   const [catalogBusy, setCatalogBusy] = useState(false);
   const [catalogError, setCatalogError] = useState<string | null>(null);
-  const autoReportFor = useRef<string | null>(null);
 
   const redacted = extracted ? redactText(extracted.text, spans, dateMode).redacted : "";
   const accepted = spans.filter((span) => span.accepted).length;
@@ -119,8 +118,6 @@ export function HarborApp() {
     };
   }, [showKeyFields]);
 
-  const reportFingerprint = useMemo(() => `${dateMode}:${redacted.length}:${accepted}`, [dateMode, redacted, accepted]);
-
   function clearDerivedState() {
     setExtracted(null);
     setSpans([]);
@@ -131,7 +128,6 @@ export function HarborApp() {
     setReportBusy(false);
     setReportError(null);
     setCopied(null);
-    autoReportFor.current = null;
   }
 
   async function requestReportText(
@@ -208,10 +204,7 @@ export function HarborApp() {
           }
         },
         onReportBusy: setReportBusy,
-        onReport: (nextReport) => {
-          setReport(nextReport);
-          autoReportFor.current = reportFingerprint;
-        },
+        onReport: setReport,
         onReportError: setReportError,
         onReject: (message) => {
           setStage("idle");
@@ -290,7 +283,6 @@ export function HarborApp() {
       if (!intakeGeneration.current.isCurrent(token)) return;
       if (!textOut) return;
       setReport(textOut);
-      autoReportFor.current = reportFingerprint;
     } catch (err) {
       if (!intakeGeneration.current.isCurrent(token)) return;
       setReportError(err instanceof Error ? err.message : "Report failed.");
@@ -318,7 +310,7 @@ export function HarborApp() {
             </h1>
             <p className="mt-3 max-w-prose text-sm leading-relaxed text-muted sm:text-base">
               {mode === "simple"
-                ? "Drop a PDF or DOCX, fix the highlights, and Harbor writes the report. Download it or copy it."
+                ? "Drop a PDF or DOCX, review the highlights, then choose whether to create and download a report."
                 : "Full controls: known identity, date handling, findings, and OpenRouter when no server secret is set."}
             </p>
           </div>

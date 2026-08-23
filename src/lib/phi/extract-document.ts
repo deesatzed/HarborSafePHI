@@ -17,11 +17,13 @@ type DocxReadResult = {
 };
 
 type DocxArchiveSummary = { entries: number; totalUncompressedBytes: number };
+type DocxArchiveLimits = { maxEntries?: number; maxUncompressedBytes?: number };
 
 type ExtractDocumentOptions = {
   readDocx?: (arrayBuffer: ArrayBuffer) => Promise<DocxReadResult>;
   inspectDocx?: (arrayBuffer: ArrayBuffer) => Promise<DocxArchiveSummary>;
   extractPdf?: (file: File) => Promise<ExtractedPdf>;
+  normalizeText?: (text: string) => string;
 };
 
 function requireReadableText(document: ExtractedDocument): ExtractedDocument {
@@ -41,27 +43,57 @@ function requireReadableText(document: ExtractedDocument): ExtractedDocument {
   return { ...document, hasTextLayer: true };
 }
 
-async function inspectDocxArchive(arrayBuffer: ArrayBuffer): Promise<DocxArchiveSummary> {
+export async function inspectDocxArchive(
+  arrayBuffer: ArrayBuffer,
+  limits: DocxArchiveLimits = {},
+): Promise<DocxArchiveSummary> {
+  const maxEntries = limits.maxEntries ?? MAX_DOCX_ENTRIES;
+  const maxUncompressedBytes = limits.maxUncompressedBytes ?? MAX_DOCX_UNCOMPRESSED_BYTES;
   const { default: JSZip } = await import("jszip");
   const archive = await JSZip.loadAsync(arrayBuffer);
   let totalUncompressedBytes = 0;
-  const entries = Object.values(archive.files);
+  const archiveEntries = Object.values(archive.files);
+  if (archiveEntries.length > maxEntries) {
+    throw new Error("This DOCX has too many internal entries for Harbor's local limit.");
+  }
+  const entries = archiveEntries.filter((entry) => !entry.dir);
   for (const entry of entries) {
     const data = (entry as typeof entry & { _data?: { uncompressedSize?: number } })._data;
-    totalUncompressedBytes += data?.uncompressedSize ?? 0;
-    if (totalUncompressedBytes > MAX_DOCX_UNCOMPRESSED_BYTES) break;
+    const size = data?.uncompressedSize;
+    if (!Number.isSafeInteger(size) || (size as number) < 0) {
+      throw new Error("Harbor could not safely inspect this DOCX archive.");
+    }
+    totalUncompressedBytes += size as number;
+    if (totalUncompressedBytes > maxUncompressedBytes) {
+      throw new Error("This DOCX expands beyond Harbor's local limit.");
+    }
   }
   return { entries: entries.length, totalUncompressedBytes };
 }
 
 function safeDocxWarnings(messages: DocxMessage[]): string[] {
-  if (messages.some((message) => message.type === "error")) {
-    throw new Error("This DOCX could not be extracted completely. Save a clean DOCX or use a text PDF.");
+  const warnings: string[] = [];
+  let warningCount = 0;
+  for (const message of messages) {
+    if (message.type === "error") {
+      throw new Error("This DOCX could not be extracted completely. Save a clean DOCX or use a text PDF.");
+    }
+    if (message.type !== "warning" || typeof message.message !== "string") continue;
+    warningCount += 1;
+    if (warnings.length >= 8) continue;
+    const safe = message.message.replace(/\p{Cc}+/gu, " ").trim().slice(0, 240);
+    if (safe) warnings.push(safe);
   }
-  return messages
-    .filter((message) => message.type === "warning" && typeof message.message === "string")
-    .map((message) => message.message!.replace(/\p{Cc}+/gu, " ").trim().slice(0, 240))
-    .filter(Boolean);
+  if (warningCount > 8) warnings.push(`${warningCount - 8} additional extraction warnings omitted.`);
+  return warnings;
+}
+
+function normalizeDocumentText(text: string): string {
+  return text
+    .replace(/\r\n?/g, "\n")
+    .replace(/[ \t]+\n/g, "\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
 }
 
 export function documentKind(file: Pick<File, "name" | "type">): DocumentKind {
@@ -106,11 +138,10 @@ export async function extractDocumentText(
     });
   const result = await readDocx(arrayBuffer);
   const warnings = safeDocxWarnings(result.messages);
-  const text = result.value
-    .replace(/\r\n?/g, "\n")
-    .replace(/[ \t]+\n/g, "\n")
-    .replace(/\n{3,}/g, "\n\n")
-    .trim();
+  if (result.value.length > MAX_EXTRACTED_CHARACTERS) {
+    throw new Error("This document contains too much extracted text for Harbor's local limit.");
+  }
+  const text = (options.normalizeText ?? normalizeDocumentText)(result.value);
 
   return requireReadableText({
     kind: "docx",

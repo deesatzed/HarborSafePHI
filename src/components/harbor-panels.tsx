@@ -264,8 +264,9 @@ export function ReportPanel({
         </div>
       ) : mode === "simple" ? (
         <p className="text-xs leading-relaxed text-muted">
-          Automatic reports need OPENROUTER_API_KEY and OPENROUTER_MODEL or OPENROUTER_MODEL_1 in `.env` or Fly
-          secrets. Switch to Complex to paste a key for this browser only.
+          Creating a report requires OPENROUTER_API_KEY and OPENROUTER_MODEL or OPENROUTER_MODEL_1 in `.env` or Fly
+          secrets. Review the redacted text, then select Create report. Switch to Complex to paste a key for this
+          browser only.
         </p>
       ) : null}
 

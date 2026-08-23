@@ -25,6 +25,7 @@ test("Harbor accepts PDF and DOCX through a local document extractor", () => {
   assert.match(app, /"harbor-hydrated"/);
   assert.match(app, /data-testid="document-input"/);
   assert.doesNotMatch(app, /createReport:\s*mode === "simple"/);
+  assert.doesNotMatch(app, /Harbor writes the report|Automatic reports need/);
   assert.match(extractor, /import\("mammoth"\)/);
   assert.doesNotMatch(extractor, /mammoth\/mammoth\.browser/);
   assert.match(extractor, /MAX_DOCUMENT_BYTES/);

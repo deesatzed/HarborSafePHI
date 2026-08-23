@@ -47,7 +47,16 @@ function networkAudit(page, sensitiveValues) {
   return state;
 }
 
+async function waitForAudit(predicate, label) {
+  const deadline = Date.now() + timeout;
+  while (!predicate()) {
+    if (Date.now() > deadline) throw new Error(`Timed out waiting for ${label}.`);
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+}
+
 let browser;
+let releaseModelRequest = () => {};
 try {
   browser = await chromium.launch({ headless: true, args: ["--no-sandbox", "--disable-dev-shm-usage"] });
   const page = await browser.newPage();
@@ -57,20 +66,28 @@ try {
     if (message.type() === "error") errors.push(message.text());
   });
   page.on("pageerror", (error) => errors.push(error.message));
+  const modelRequestGate = new Promise((resolve) => {
+    releaseModelRequest = resolve;
+  });
   await page.route("**/*", async (route) => {
     const requestUrl = route.request().url();
-    if (/huggingface\.co|cdn-lfs|hf\.co/.test(requestUrl)) return route.abort("blockedbyclient");
+    if (/huggingface\.co|cdn-lfs|hf\.co/.test(requestUrl)) {
+      await modelRequestGate;
+      return route.abort("blockedbyclient");
+    }
     return route.continue();
   });
   await page.goto(url, { waitUntil: "domcontentloaded", timeout });
   await page.locator('[data-testid="harbor-hydrated"]').waitFor({ state: "visible", timeout });
-  await page.getByRole("button", { name: "complex", exact: true }).click();
   audit.enabled = true;
   await page.locator('[data-testid="document-input"]').setInputFiles({
     name: fileName,
     mimeType: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
     buffer: await syntheticDocx(),
   });
+  await waitForAudit(() => audit.modelRequests > 0, "the local model request");
+  await page.getByRole("button", { name: "complex", exact: true }).click();
+  releaseModelRequest();
   await page.getByText(fileName, { exact: true }).waitFor({ state: "visible", timeout });
   await page.locator('[data-testid="redacted"]').getByText(marker, { exact: false }).waitFor({ state: "visible", timeout });
   if (audit.summaryRequests || audit.sameOriginMutations || audit.sensitiveEgress) {
@@ -82,7 +99,12 @@ try {
   if (unexpectedErrors.length > 0) throw new Error(`browser errors: ${unexpectedErrors.join(" | ")}`);
 
   const unreadablePage = await browser.newPage();
+  const unreadableErrors = [];
   const unreadableAudit = networkAudit(unreadablePage, [unreadableFileName, "short"]);
+  unreadablePage.on("console", (message) => {
+    if (message.type() === "error") unreadableErrors.push(message.text());
+  });
+  unreadablePage.on("pageerror", (error) => unreadableErrors.push(error.message));
   await unreadablePage.route("**/*", async (route) => {
     const requestUrl = route.request().url();
     if (/huggingface\.co|cdn-lfs|hf\.co/.test(requestUrl)) return route.abort("blockedbyclient");
@@ -106,8 +128,15 @@ try {
   ) {
     throw new Error(`unreadable DOCX crossed a model/report/egress boundary: ${JSON.stringify(unreadableAudit)}`);
   }
+  const unexpectedUnreadableErrors = unreadableErrors.filter(
+    (message) => !/Failed to load resource|ERR_BLOCKED_BY_CLIENT/.test(message),
+  );
+  if (unexpectedUnreadableErrors.length > 0) {
+    throw new Error(`unreadable browser errors: ${unexpectedUnreadableErrors.join(" | ")}`);
+  }
   console.log(JSON.stringify({ ok: true, fileName, markerVisible: true, audit, unreadableAudit }, null, 2));
 } catch (error) {
+  releaseModelRequest();
   console.error(JSON.stringify({ ok: false, error: String(error?.message ?? error) }, null, 2));
   process.exitCode = 1;
 } finally {
