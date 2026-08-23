@@ -13,12 +13,17 @@ test("Harbor accepts PDF and DOCX through a local document extractor", () => {
   assert.equal(existsSync(new URL("../src/lib/phi/extract-document.ts", import.meta.url)), true);
   assert.match(app, /accept="[^"]*\.docx/);
   assert.match(app, /extractDocumentText/);
+  assert.match(app, /orchestrateDocumentIntake/);
+  assert.match(app, /new IntakeGeneration\(\)/);
   assert.match(app, /Drop a MyChart PDF or DOCX here/);
   assert.match(app, /PDF or DOCX stays in this tab/);
   assert.match(app, /type ExtractedDocument/);
   assert.match(app, /setExtracted\(null\)/);
   assert.match(app, /setSpans\(\[\]\)/);
   assert.match(app, /setReport\(null\)/);
+  assert.match(app, /setReportBusy\(false\)/);
+  assert.match(app, /"harbor-hydrated"/);
+  assert.match(app, /data-testid="document-input"/);
   assert.match(extractor, /import\("mammoth"\)/);
   assert.doesNotMatch(extractor, /mammoth\/mammoth\.browser/);
   assert.match(extractor, /MAX_DOCUMENT_BYTES/);

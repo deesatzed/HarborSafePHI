@@ -14,6 +14,7 @@ import { detectLocalPhi, supplementWithLocalPhi } from "@/lib/phi/detect";
 import { buildExport, downloadTextFile } from "@/lib/phi/export";
 import { extractDocumentText } from "@/lib/phi/extract-document";
 import { buildSamplePdf } from "@/lib/phi/extract-pdf";
+import { IntakeGeneration, orchestrateDocumentIntake } from "@/lib/phi/intake-orchestrator";
 import { prepareModelInput } from "@/lib/phi/packet";
 import { formatExtractorCompare } from "@/lib/phi/pdf-text";
 import { isOpenMedCached, scanWithOpenMed } from "@/lib/phi/openmed";
@@ -49,6 +50,8 @@ function readMode(): HarborMode {
 
 export function HarborApp() {
   const inputRef = useRef<HTMLInputElement>(null);
+  const intakeGeneration = useRef(new IntakeGeneration());
+  const [hydrated, setHydrated] = useState(false);
   const [mode, setMode] = useState<HarborMode>(readMode);
   const [stage, setStage] = useState<Stage>("idle");
   const [status, setStatus] = useState("Reading document…");
@@ -77,6 +80,10 @@ export function HarborApp() {
   const redacted = extracted ? redactText(extracted.text, spans, dateMode).redacted : "";
   const accepted = spans.filter((span) => span.accepted).length;
   const showKeyFields = mode === "complex" && !config?.configured;
+
+  useEffect(() => {
+    setHydrated(true);
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
@@ -121,96 +128,133 @@ export function HarborApp() {
     setDetectors([]);
     setOpenmedNote("");
     setReport(null);
+    setReportBusy(false);
     setReportError(null);
     setCopied(null);
     autoReportFor.current = null;
   }
 
-  async function runPipeline(extractedDoc: ExtractedDocument) {
-    setExtracted(extractedDoc);
-    setCopied(null);
-    setDocView("redacted");
-    setReport(null);
-    setReportError(null);
-    autoReportFor.current = null;
-    const cached = await isOpenMedCached();
-    setStatus(cached ? "Loading cached OpenMed…" : "Downloading OpenMed into this browser…");
-    let nextOpenMed: PhiSpan[] = [];
-    let used = ["regex", "labels"];
-    try {
-      const result = await scanWithOpenMed({
-        text: extractedDoc.text,
-        onProgress: (message) => {
-          setStatus(message);
-          setOpenmedNote(message);
-        },
-      });
-      nextOpenMed = result.spans;
-      used = ["openmed", "regex", "labels"];
-      setOpenmedNote(
-        `OpenMed (${result.device}) marked ${result.spans.length} spans, then local rules filled gaps.`,
+  async function requestReportText(
+    automatic: boolean,
+    doc: ExtractedDocument,
+    nextSpans: PhiSpan[],
+    token: number,
+  ): Promise<string | null> {
+    if (automatic && autoReportFor.current === reportFingerprint) return null;
+    const text = prepareModelInput(redactText(doc.text, nextSpans, "keep").redacted);
+    const serverResult = await generateServerReport({
+      data: {
+        redactedText: text,
+        model: config?.configured
+          ? config.models.includes(model)
+            ? model
+            : (config.model ?? "")
+          : "",
+      },
+    });
+    if (!intakeGeneration.current.isCurrent(token)) return null;
+    if (serverResult.ok) return serverResult.text;
+
+    const missingSecrets = /OPENROUTER_API_KEY and OPENROUTER_MODEL/.test(serverResult.error);
+    if (automatic && missingSecrets) return null;
+    if (!missingSecrets) throw new Error(serverResult.error);
+    if (!apiKey.trim() || !model.trim()) {
+      throw new Error(
+        "Set OPENROUTER_API_KEY and OPENROUTER_MODEL on the server (including Fly secrets), or paste a key and model in Complex.",
       );
-    } catch (err) {
-      const message = err instanceof Error ? err.message : "OpenMed failed to load.";
-      setOpenmedNote(message);
-      setError(`OpenMed did not finish: ${message} Local rules still ran.`);
     }
-    const merged =
-      nextOpenMed.length > 0
-        ? supplementWithLocalPhi(extractedDoc.text, nextOpenMed, seed)
-        : detectLocalPhi(extractedDoc.text, seed);
-    setOpenMedSpans(nextOpenMed);
-    setSpans(merged);
-    setDetectors(used);
-    setStage("review");
-    if (!extractedDoc.hasTextLayer) {
-      setError("This document has too little readable text. Harbor cannot OCR scans yet — use a text PDF or DOCX, not a photograph.");
-    } else if (nextOpenMed.length > 0) {
-      setError(null);
-    }
-    if (mode === "simple") {
-      void createReport(true, extractedDoc, merged);
-    }
+    writeOpenRouterKey(apiKey);
+    writeOpenRouterModel(model);
+    const textOut = await summarizeWithOpenRouter({
+      apiKey,
+      model,
+      redactedText: text,
+    });
+    if (!intakeGeneration.current.isCurrent(token)) return null;
+    return textOut;
+  }
+
+  async function startIntake(
+    loadDocument: () => Promise<ExtractedDocument>,
+    initialStatus: string,
+  ) {
+    await orchestrateDocumentIntake({
+      generation: intakeGeneration.current,
+      loadDocument,
+      isOpenMedCached,
+      scanOpenMed: scanWithOpenMed,
+      mergeSpans: (document, nextOpenMed) =>
+        nextOpenMed.length > 0
+          ? supplementWithLocalPhi(document.text, nextOpenMed, seed)
+          : detectLocalPhi(document.text, seed),
+      createReport:
+        mode === "simple"
+          ? (document, nextSpans, token) => requestReportText(true, document, nextSpans, token)
+          : undefined,
+      callbacks: {
+        onClear: clearDerivedState,
+        onWorking: () => {
+          setError(null);
+          setStage("working");
+          setStatus(initialStatus);
+        },
+        onStatus: setStatus,
+        onOpenMedNote: setOpenmedNote,
+        onOpenMedError: setError,
+        onReview: ({ document, openMedSpans: nextOpenMed, spans: merged, detectors: used }) => {
+          setExtracted(document);
+          setOpenMedSpans(nextOpenMed);
+          setSpans(merged);
+          setDetectors(used);
+          setDocView("redacted");
+          setStage("review");
+          if (nextOpenMed.length > 0) setError(null);
+        },
+        onReportBusy: setReportBusy,
+        onReport: (nextReport) => {
+          setReport(nextReport);
+          autoReportFor.current = reportFingerprint;
+        },
+        onReportError: setReportError,
+        onReject: (message) => {
+          setStage("idle");
+          setError(message);
+        },
+      },
+    });
   }
 
   async function onFile(file: File) {
-    clearDerivedState();
-    setError(null);
-    setStage("working");
-    setStatus("Reading document in this browser…");
-    try {
-      const extractedDoc = await extractDocumentText(file);
-      await runPipeline(extractedDoc);
-    } catch (err) {
-      setStage("idle");
-      setError(err instanceof Error ? err.message : "Could not read that document.");
-    }
+    await startIntake(
+      () => extractDocumentText(file),
+      "Reading document in this browser…",
+    );
   }
 
   async function onSample() {
-    setError(null);
-    setStage("working");
-    setStatus("Building a synthetic Epic-style chart…");
-    try {
-      const file = await buildSamplePdf();
-      await onFile(file);
-    } catch {
-      await runPipeline({
-        kind: "pdf",
-        fileName: SAMPLE_FILE_NAME,
-        pageCount: 2,
-        text: SAMPLE_CHART,
-        pages: [
-          { pageNumber: 1, text: SAMPLE_CHART },
-          { pageNumber: 2, text: SAMPLE_CHART },
-        ],
-        hasTextLayer: true,
-        extractor: "layout",
-      });
-    }
+    await startIntake(async () => {
+      try {
+        const file = await buildSamplePdf();
+        return await extractDocumentText(file);
+      } catch {
+        return {
+          kind: "pdf",
+          fileName: SAMPLE_FILE_NAME,
+          pageCount: 2,
+          text: SAMPLE_CHART,
+          pages: [
+            { pageNumber: 1, text: SAMPLE_CHART },
+            { pageNumber: 2, text: SAMPLE_CHART },
+          ],
+          hasTextLayer: true,
+          extractor: "layout",
+        };
+      }
+    }, "Building a synthetic Epic-style chart…");
   }
 
   function reset() {
+    intakeGeneration.current.invalidate();
     setStage("idle");
     clearDerivedState();
     setError(null);
@@ -237,52 +281,24 @@ export function HarborApp() {
   }
 
   async function createReport(
-    automatic = false,
     doc = extracted,
     nextSpans = spans,
   ) {
     if (!doc) return;
-    if (automatic && autoReportFor.current === reportFingerprint) return;
-    const text = prepareModelInput(redactText(doc.text, nextSpans, "keep").redacted);
+    const token = intakeGeneration.current.current();
     setReportBusy(true);
     setReportError(null);
     try {
-      const serverResult = await generateServerReport({
-        data: {
-          redactedText: text,
-          model: config?.configured
-            ? config.models.includes(model)
-              ? model
-              : (config.model ?? "")
-            : "",
-        },
-      });
-      if (serverResult.ok) {
-        setReport(serverResult.text);
-        autoReportFor.current = reportFingerprint;
-        return;
-      }
-      const missingSecrets = /OPENROUTER_API_KEY and OPENROUTER_MODEL/.test(serverResult.error);
-      if (automatic && missingSecrets) return;
-      if (!missingSecrets) throw new Error(serverResult.error);
-      if (!apiKey.trim() || !model.trim()) {
-        throw new Error(
-          "Set OPENROUTER_API_KEY and OPENROUTER_MODEL on the server (including Fly secrets), or paste a key and model in Complex.",
-        );
-      }
-      writeOpenRouterKey(apiKey);
-      writeOpenRouterModel(model);
-      const textOut = await summarizeWithOpenRouter({
-        apiKey,
-        model,
-        redactedText: text,
-      });
+      const textOut = await requestReportText(false, doc, nextSpans, token);
+      if (!intakeGeneration.current.isCurrent(token)) return;
+      if (!textOut) return;
       setReport(textOut);
       autoReportFor.current = reportFingerprint;
     } catch (err) {
+      if (!intakeGeneration.current.isCurrent(token)) return;
       setReportError(err instanceof Error ? err.message : "Report failed.");
     } finally {
-      setReportBusy(false);
+      if (intakeGeneration.current.isCurrent(token)) setReportBusy(false);
     }
   }
 
@@ -292,7 +308,10 @@ export function HarborApp() {
   }
 
   return (
-    <main className="min-h-dvh bg-bg text-ink">
+    <main
+      className="min-h-dvh bg-bg text-ink"
+      data-testid={hydrated ? "harbor-hydrated" : undefined}
+    >
       <div className="mx-auto flex w-full max-w-6xl flex-col gap-6 px-4 py-6 sm:px-6 sm:py-10">
         <header className="flex flex-wrap items-end justify-between gap-4">
           <div className="max-w-xl">
@@ -402,6 +421,7 @@ export function HarborApp() {
             </button>
             <input
               ref={inputRef}
+              data-testid="document-input"
               type="file"
               accept="application/pdf,.pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document,.docx"
               className="sr-only"
@@ -479,7 +499,7 @@ export function HarborApp() {
                 reportBusy={reportBusy}
                 reportError={reportError}
                 copied={copied}
-                onCreate={() => void createReport(false)}
+                onCreate={() => void createReport()}
                 onCopyReport={() => {
                   if (report) void copy("report", report);
                 }}
