@@ -27,3 +27,15 @@
 - Verified 226 tests, typecheck, lint, lockfile dry-run, production build, and the built-browser intake proof.
 - Independent quality review classified both remaining recommendations as Accepted: bound warning sanitation work and make the final report instruction explicitly user-triggered. No recommendations were Rejected or left as Needs Investigation.
 - Task 1 is complete. OpenMed WebGPU-first selection and WASM fallback remain Task 2; real OpenMed runtime inference is not yet claimed.
+
+## 2026-08-23 — OpenMed device and runtime state
+
+- Added WebGPU-first OpenMed loading with the pinned `fp16` variant and a WASM `int8` fallback.
+- Added immutable provenance for the public clinical PII model, its Hugging Face revision, OpenMed runtime `2.1.0`, and deterministic ruleset `harbor-rules-v1`.
+- Corrected the stale plan model constant after verifying that its named repository was not publicly resolvable; the rationale and immutable replacement are recorded in `DECISIONS.md`.
+- Initialization failures now emit deterministic-only degraded status, clear poisoned state, and allow retry. Concurrent callers share bounded progress notifications.
+- Runtime becomes ready only after inference succeeds. Inference failure resets the unusable engine and records degraded state so local-rules fallback cannot inherit false OpenMed-ready provenance.
+- Added monotonic inference ownership so stale scans cannot overwrite the state of a newer intake or clobber a newer initialization.
+- Quality-review recommendations were all Accepted and implemented across two corrective commits; the final independent re-review found no Critical, Important, or Minor issues.
+- Verified 240 tests, typecheck, lint, diff check, and production build. Task 2 is complete.
+- Real browser WebGPU/WASM inference remains unproven and must not be described as working until the dedicated runtime proof gate passes.
