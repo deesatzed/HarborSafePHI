@@ -1,6 +1,22 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { runOpenMedAttempts } from "./openmed.ts";
+import {
+  createOpenMedSession,
+  OPENMED_MODEL,
+  OPENMED_MODEL_REVISION,
+  runOpenMedAttempts,
+} from "./openmed.ts";
+
+function fakeEngine(pipeline: () => Promise<never[]> = async () => []) {
+  return {
+    pipeline,
+    device: "wasm" as const,
+    variant: "int8" as const,
+    model: OPENMED_MODEL,
+    revision: OPENMED_MODEL_REVISION,
+    normalizeLabel: () => "OTHER" as const,
+  };
+}
 
 test("WebGPU success does not try WASM", async () => {
   const seen: unknown[] = [];
@@ -63,7 +79,9 @@ test("progress announces fallback only while another attempt remains", async () 
     (message) => messages.push(message),
   );
 
-  assert.deepEqual(messages, ["WebGPU unavailable. Trying OpenMed on WASM…"]);
+  assert.deepEqual(messages, [
+    "WebGPU OpenMed attempt failed. Trying OpenMed on WASM…",
+  ]);
 });
 
 test("final failure announces deterministic-only degraded mode", async () => {
@@ -83,4 +101,93 @@ test("final failure announces deterministic-only degraded mode", async () => {
   assert.deepEqual(messages, [
     "OpenMed unavailable. Harbor is continuing in deterministic-only degraded mode.",
   ]);
+});
+
+test("initialization failure resets loading so the next call retries and succeeds", async () => {
+  let initializationCalls = 0;
+  const messages: string[] = [];
+  const session = createOpenMedSession(async () => {
+    initializationCalls += 1;
+    if (initializationCalls === 1) throw new Error("transformers import failed");
+    return fakeEngine();
+  });
+
+  await assert.rejects(
+    session.load((message) => messages.push(message)),
+    /transformers import failed/,
+  );
+  const loaded = await session.load((message) => messages.push(message));
+
+  assert.equal(initializationCalls, 2);
+  assert.equal(loaded.device, "wasm");
+  assert.deepEqual(messages, [
+    "OpenMed unavailable. Harbor is continuing in deterministic-only degraded mode.",
+  ]);
+});
+
+test("pipeline failure downgrades runtime and discards the unusable engine", async () => {
+  let initializationCalls = 0;
+  const session = createOpenMedSession(async () => {
+    initializationCalls += 1;
+    return fakeEngine(async () => {
+      throw new Error("inference failed");
+    });
+  });
+
+  await assert.rejects(
+    session.runInference(async (loaded) => loaded.pipeline("test")),
+    /inference failed/,
+  );
+
+  assert.deepEqual(session.getRuntimeState(), {
+    status: "degraded",
+    device: null,
+    variant: null,
+    model: OPENMED_MODEL,
+    revision: OPENMED_MODEL_REVISION,
+  });
+  await session.load();
+  assert.equal(initializationCalls, 2);
+});
+
+test("runtime becomes ready only after inference succeeds", async () => {
+  const session = createOpenMedSession(async () => fakeEngine());
+
+  await session.load();
+  assert.equal(session.getRuntimeState().status, "degraded");
+
+  await session.runInference(async (loaded) => loaded.pipeline("test"));
+
+  assert.deepEqual(session.getRuntimeState(), {
+    status: "ready",
+    device: "wasm",
+    variant: "int8",
+    model: OPENMED_MODEL,
+    revision: OPENMED_MODEL_REVISION,
+  });
+});
+
+test("concurrent callers receive shared initialization progress", async () => {
+  let report: ((message: string) => void) | undefined;
+  let finishInitialization: (() => void) | undefined;
+  const initializationGate = new Promise<void>((resolve) => {
+    finishInitialization = resolve;
+  });
+  const session = createOpenMedSession(async (onProgress) => {
+    report = onProgress;
+    await initializationGate;
+    return fakeEngine();
+  });
+  const firstMessages: string[] = [];
+  const secondMessages: string[] = [];
+
+  const firstLoad = session.load((message) => firstMessages.push(message));
+  await Promise.resolve();
+  const secondLoad = session.load((message) => secondMessages.push(message));
+  report?.("Shared model progress");
+  finishInitialization?.();
+  await Promise.all([firstLoad, secondLoad]);
+
+  assert.deepEqual(firstMessages, ["Shared model progress"]);
+  assert.deepEqual(secondMessages, ["Shared model progress"]);
 });

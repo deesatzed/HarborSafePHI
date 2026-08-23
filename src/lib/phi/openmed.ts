@@ -7,6 +7,8 @@ export const OPENMED_MODEL_REVISION = "79f7db205869b1be4be23ac4f42aa95bdedc5aee"
 export const OPENMED_RUNTIME_VERSION = "2.1.0";
 export const DETERMINISTIC_RULESET_VERSION = "harbor-rules-v1";
 const CACHE_KEY = "transformers-cache";
+const DEGRADED_MESSAGE =
+  "OpenMed unavailable. Harbor is continuing in deterministic-only degraded mode.";
 
 export type OpenMedDevice = "webgpu" | "wasm";
 
@@ -23,7 +25,7 @@ export type OpenMedRuntimeState = {
   revision: string;
 };
 
-type LoadedEngine = {
+export type OpenMedEngine = {
   pipeline: TokenClassificationPipeline;
   device: OpenMedDevice;
   variant: OpenMedAttempt["variant"];
@@ -32,19 +34,9 @@ type LoadedEngine = {
   normalizeLabel: (label: string) => CanonicalLabel;
 };
 
-let engine: LoadedEngine | null = null;
-let loading: Promise<LoadedEngine> | null = null;
-let runtime: OpenMedRuntimeState = {
-  status: "degraded",
-  device: null,
-  variant: null,
-  model: OPENMED_MODEL,
-  revision: OPENMED_MODEL_REVISION,
-};
-
-export function getOpenMedRuntimeState(): OpenMedRuntimeState {
-  return { ...runtime };
-}
+export type OpenMedInitializer = (
+  onProgress: (message: string) => void,
+) => Promise<OpenMedEngine>;
 
 export function openMedAttempts(hasWebGpu: boolean): OpenMedAttempt[] {
   return hasWebGpu
@@ -69,16 +61,125 @@ export async function runOpenMedAttempts<T>(
     } catch (error) {
       finalFailure = error;
       if (index < attempts.length - 1) {
-        onProgress?.("WebGPU unavailable. Trying OpenMed on WASM…");
+        onProgress?.("WebGPU OpenMed attempt failed. Trying OpenMed on WASM…");
       } else {
-        onProgress?.(
-          "OpenMed unavailable. Harbor is continuing in deterministic-only degraded mode.",
-        );
+        onProgress?.(DEGRADED_MESSAGE);
       }
     }
   }
 
   throw finalFailure;
+}
+
+function degradedRuntime(): OpenMedRuntimeState {
+  return {
+    status: "degraded",
+    device: null,
+    variant: null,
+    model: OPENMED_MODEL,
+    revision: OPENMED_MODEL_REVISION,
+  };
+}
+
+function notify(
+  listener: ((message: string) => void) | undefined,
+  message: string,
+): void {
+  try {
+    listener?.(message);
+  } catch {
+    // Progress reporting must not change local redaction behavior.
+  }
+}
+
+export function createOpenMedSession(initialize: OpenMedInitializer) {
+  let engine: OpenMedEngine | null = null;
+  let loading: Promise<OpenMedEngine> | null = null;
+  let runtime = degradedRuntime();
+  const progressSubscribers = new Set<(message: string) => void>();
+
+  const broadcast = (message: string) => {
+    for (const subscriber of progressSubscribers) notify(subscriber, message);
+  };
+
+  const load = async (
+    onProgress?: (message: string) => void,
+  ): Promise<OpenMedEngine> => {
+    if (engine) {
+      notify(
+        onProgress,
+        `OpenMed engine loaded (${engine.device}); starting local scan.`,
+      );
+      return engine;
+    }
+
+    if (onProgress) progressSubscribers.add(onProgress);
+    if (!loading) {
+      let degradedMessageSent = false;
+      const report = (message: string) => {
+        if (message === DEGRADED_MESSAGE) degradedMessageSent = true;
+        broadcast(message);
+      };
+
+      loading = (async () => {
+        try {
+          const loaded = await initialize(report);
+          engine = loaded;
+          return loaded;
+        } catch (error) {
+          engine = null;
+          runtime = degradedRuntime();
+          if (!degradedMessageSent) report(DEGRADED_MESSAGE);
+          throw error instanceof Error ? error : new Error("OpenMed failed to load");
+        } finally {
+          loading = null;
+        }
+      })();
+    }
+
+    const activeLoad = loading;
+    try {
+      return await activeLoad;
+    } finally {
+      if (onProgress) progressSubscribers.delete(onProgress);
+    }
+  };
+
+  const runInference = async <T>(
+    operation: (loaded: OpenMedEngine) => Promise<T>,
+    onProgress?: (message: string) => void,
+  ): Promise<T> => {
+    const loaded = await load(onProgress);
+    try {
+      const result = await operation(loaded);
+      if (engine === loaded) {
+        runtime = {
+          status: "ready",
+          device: loaded.device,
+          variant: loaded.variant,
+          model: loaded.model,
+          revision: loaded.revision,
+        };
+      }
+      notify(
+        onProgress,
+        `OpenMed scan complete on ${loaded.device === "webgpu" ? "WebGPU" : "WASM"}.`,
+      );
+      return result;
+    } catch (error) {
+      if (engine === loaded) engine = null;
+      loading = null;
+      runtime = degradedRuntime();
+      notify(onProgress, DEGRADED_MESSAGE);
+      throw error instanceof Error ? error : new Error("OpenMed inference failed");
+    }
+  };
+
+  return {
+    load,
+    runInference,
+    getRuntimeState: (): OpenMedRuntimeState => ({ ...runtime }),
+  };
 }
 
 const LABEL_TO_CATEGORY: Partial<Record<CanonicalLabel, PhiCategory>> = {
@@ -155,7 +256,6 @@ export function chunkText(text: string, size = 900, overlap = 80): { start: numb
 }
 
 export async function isOpenMedCached(): Promise<boolean> {
-  if (engine) return true;
   if (typeof caches === "undefined") return false;
   try {
     const cache = await caches.open(CACHE_KEY);
@@ -193,86 +293,75 @@ async function configureHub(onProgress: (message: string) => void) {
   return { transformers, progress };
 }
 
-export async function loadOpenMed(onProgress?: (message: string) => void): Promise<LoadedEngine> {
-  if (engine) {
-    onProgress?.(`OpenMed ready from cache (${engine.device}).`);
-    return engine;
-  }
-  if (loading) return loading;
+async function initializeOpenMed(
+  onProgress: (message: string) => void,
+): Promise<OpenMedEngine> {
+  const cached = await isOpenMedCached();
+  onProgress(
+    cached
+      ? "OpenMed cache data found. Loading the pinned on-device model…"
+      : "OpenMed cache data not found. Downloading the pinned on-device model…",
+  );
+  const { transformers, progress } = await configureHub(onProgress);
+  const openmed = await import("openmed");
 
-  loading = (async () => {
-    const cached = await isOpenMedCached();
-    onProgress?.(cached ? "Loading OpenMed from this browser’s cache…" : "OpenMed is not cached yet. Downloading the on-device model…");
-    const { transformers, progress } = await configureHub(onProgress ?? (() => undefined));
-    const openmed = await import("openmed");
-
-    const tryLoad = async (attempt: OpenMedAttempt): Promise<LoadedEngine> => {
-      onProgress?.(
-        attempt.device === "webgpu"
-          ? cached
-            ? "Starting OpenMed on WebGPU…"
-            : "Downloading the WebGPU OpenMed weights…"
-          : cached
-            ? "Starting OpenMed on WASM…"
-            : "Downloading the WASM OpenMed weights…",
-      );
-      const pipeline = await openmed.loadOnnxModel(OPENMED_MODEL, {
-        variant: attempt.variant,
-        device: attempt.device,
-        revision: OPENMED_MODEL_REVISION,
-        allowRemoteModels: true,
-        localFilesOnly: false,
-        runtime: {
-          pipeline: ((task, model, options) =>
-            transformers.pipeline(task, model, options)) as TransformersRuntime["pipeline"],
-          env: transformers.env,
-        },
-        pipelineOptions: {
-          progress_callback: progress,
-          subfolder: "",
-        },
-      });
-      return {
-        pipeline,
-        device: attempt.device,
-        variant: attempt.variant,
-        model: OPENMED_MODEL,
-        revision: OPENMED_MODEL_REVISION,
-        normalizeLabel: openmed.normalizeLabel,
-      };
+  const tryLoad = async (attempt: OpenMedAttempt): Promise<OpenMedEngine> => {
+    onProgress(
+      attempt.device === "webgpu"
+        ? cached
+          ? "Starting OpenMed on WebGPU from available cache data…"
+          : "Downloading the WebGPU OpenMed weights…"
+        : cached
+          ? "Starting OpenMed on WASM from available cache data…"
+          : "Downloading the WASM OpenMed weights…",
+    );
+    const pipeline = await openmed.loadOnnxModel(OPENMED_MODEL, {
+      variant: attempt.variant,
+      device: attempt.device,
+      revision: OPENMED_MODEL_REVISION,
+      allowRemoteModels: true,
+      localFilesOnly: false,
+      runtime: {
+        pipeline: ((task, model, options) =>
+          transformers.pipeline(task, model, options)) as TransformersRuntime["pipeline"],
+        env: transformers.env,
+      },
+      pipelineOptions: {
+        progress_callback: progress,
+        subfolder: "",
+      },
+    });
+    return {
+      pipeline,
+      device: attempt.device,
+      variant: attempt.variant,
+      model: OPENMED_MODEL,
+      revision: OPENMED_MODEL_REVISION,
+      normalizeLabel: openmed.normalizeLabel,
     };
+  };
 
-    try {
-      engine = await runOpenMedAttempts(
-        webGpuAvailable(),
-        tryLoad,
-        onProgress,
-      );
-      runtime = {
-        status: "ready",
-        device: engine.device,
-        variant: engine.variant,
-        model: engine.model,
-        revision: engine.revision,
-      };
-      onProgress?.(
-        `OpenMed ready on ${engine.device === "webgpu" ? "WebGPU" : "WASM"}. Weights stay in this browser.`,
-      );
-      return engine;
-    } catch (error) {
-      runtime = {
-        status: "degraded",
-        device: null,
-        variant: null,
-        model: OPENMED_MODEL,
-        revision: OPENMED_MODEL_REVISION,
-      };
-      loading = null;
-      throw error instanceof Error ? error : new Error("OpenMed failed to load");
-    }
-  })();
+  const loaded = await runOpenMedAttempts(
+    webGpuAvailable(),
+    tryLoad,
+    onProgress,
+  );
+  onProgress(
+    `OpenMed loaded on ${loaded.device === "webgpu" ? "WebGPU" : "WASM"}. Weights stay in this browser.`,
+  );
+  return loaded;
+}
 
-  return loading;
+const productionOpenMedSession = createOpenMedSession(initializeOpenMed);
+
+export function loadOpenMed(
+  onProgress?: (message: string) => void,
+): Promise<OpenMedEngine> {
+  return productionOpenMedSession.load(onProgress);
+}
+
+export function getOpenMedRuntimeState(): OpenMedRuntimeState {
+  return productionOpenMedSession.getRuntimeState();
 }
 
 function toPhiSpan(args: {
@@ -365,49 +454,54 @@ export async function scanWithOpenMed(args: {
   windows?: { start: number; text: string }[];
   onProgress?: (message: string) => void;
 }): Promise<{ spans: PhiSpan[]; device: OpenMedDevice; debug: string }> {
-  const loaded = await loadOpenMed(args.onProgress);
-  const windows = args.windows ?? chunkText(args.text);
-  const found: PhiSpan[] = [];
-  let rawCount = 0;
-  let i = 0;
-  for (const window of windows) {
-    i += 1;
-    args.onProgress?.(`OpenMed reading window ${i} of ${windows.length}…`);
-    const output = await loaded.pipeline(window.text, {
-      aggregation_strategy: "simple",
-      ignore_labels: ["O"],
-    });
-    const entities = flattenPipelineOutput(output);
-    rawCount += entities.length;
-    let cursor = 0;
-    entities.forEach((entity, index) => {
-      let start = Number(entity.start);
-      let end = Number(entity.end);
-      if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) {
-        const located = locateSurface(window.text, entity.word ?? "", cursor);
-        if (!located) return;
-        start = located.start;
-        end = located.end;
-        cursor = located.end;
-      } else {
-        cursor = Math.max(cursor, end);
-      }
-      const mapped = toPhiSpan({
-        canonical: canonicalFromGroup(
-          entity.entity_group ?? entity.entity ?? "",
-          loaded.normalizeLabel,
-        ),
-        start,
-        end,
-        score: entity.score ?? null,
-        text: args.text,
-        offset: window.start,
-        index: found.length + index,
+  return productionOpenMedSession.runInference(async (loaded) => {
+    const windows = args.windows ?? chunkText(args.text);
+    const found: PhiSpan[] = [];
+    let rawCount = 0;
+    let i = 0;
+    for (const window of windows) {
+      i += 1;
+      notify(args.onProgress, `OpenMed reading window ${i} of ${windows.length}…`);
+      const output = await loaded.pipeline(window.text, {
+        aggregation_strategy: "simple",
+        ignore_labels: ["O"],
       });
-      if (mapped) found.push(mapped);
-    });
-  }
-  return { spans: mergeSpans(args.text, found), device: loaded.device, debug: `raw entities ${rawCount}` };
+      const entities = flattenPipelineOutput(output);
+      rawCount += entities.length;
+      let cursor = 0;
+      entities.forEach((entity, index) => {
+        let start = Number(entity.start);
+        let end = Number(entity.end);
+        if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) {
+          const located = locateSurface(window.text, entity.word ?? "", cursor);
+          if (!located) return;
+          start = located.start;
+          end = located.end;
+          cursor = located.end;
+        } else {
+          cursor = Math.max(cursor, end);
+        }
+        const mapped = toPhiSpan({
+          canonical: canonicalFromGroup(
+            entity.entity_group ?? entity.entity ?? "",
+            loaded.normalizeLabel,
+          ),
+          start,
+          end,
+          score: entity.score ?? null,
+          text: args.text,
+          offset: window.start,
+          index: found.length + index,
+        });
+        if (mapped) found.push(mapped);
+      });
+    }
+    return {
+      spans: mergeSpans(args.text, found),
+      device: loaded.device,
+      debug: `raw entities ${rawCount}`,
+    };
+  }, args.onProgress);
 }
 
 export function webGpuAvailable(): boolean {
