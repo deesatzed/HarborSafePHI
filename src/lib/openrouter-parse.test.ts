@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { extractOpenRouterText, SYSTEM_PROMPT } from "./openrouter.ts";
+import { extractOpenRouterText, parseOpenRouterError, SYSTEM_PROMPT } from "./openrouter.ts";
 
 test("reads string content", () => {
   const got = extractOpenRouterText({
@@ -48,4 +48,18 @@ test("empty content with reasoning explains the failure", () => {
   assert.equal(got.text, "");
   assert.match(got.detail, /reasoning/);
   assert.match(got.detail, /length/);
+});
+
+test("provider errors are bounded Harbor-owned messages", () => {
+  const body = JSON.stringify({ error: { message: "patient Jane Doe SSN 123-45-6789" } });
+  const message = parseOpenRouterError(500, body);
+  assert.match(message, /^Harbor /);
+  assert.doesNotMatch(message, /Jane Doe|123-45-6789|patient/);
+  assert.ok(message.length < 160);
+
+  const refused = extractOpenRouterText({
+    choices: [{ message: { refusal: "I cannot process Jane Doe SSN 123-45-6789" } }],
+  });
+  assert.match(refused.detail, /^Harbor /);
+  assert.doesNotMatch(refused.detail, /Jane Doe|123-45-6789|cannot process/);
 });

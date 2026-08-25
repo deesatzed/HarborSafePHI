@@ -18,7 +18,9 @@ npm with a committed `package-lock.json`.
 |---|---|---|
 | Install | `npm ci` | Yes, 478 packages from lockfile |
 | Development | `npm run dev -- --port 8083` | Yes, desktop/mobile browser smoke |
-| Tests | `npm test` | Yes, 177 passing |
+| Tests | `npm test` | Yes, 249 passing (159 script, 90 application) |
+| Synthetic PHI evaluation | `npm run test:phi-eval` | Yes, 2/2 fixtures and 16/16 required surfaces |
+| Built-browser OpenMed proof | `npm run test:openmed-browser` | Yes, WASM inference, 23 spans, zero sensitive egress |
 | Type check | `npm run typecheck` | Yes |
 | Lint | `npm run lint` | Yes |
 | Production build | `NITRO_PRESET=node-server npm run build` | Yes |
@@ -28,7 +30,7 @@ npm with a committed `package-lock.json`.
 
 - `src/routes/index.tsx` mounts the Harbor interface.
 - `src/components/harbor-app.tsx` owns the workflow and UI state.
-- `src/lib/phi/` owns local extraction, detection, merging, redaction, and export.
+- `src/lib/phi/` owns local extraction, detection, merging, redaction, export, and OpenMed runtime state.
 - `.output/server/index.mjs` is the generated Fly runtime entry point.
 
 ## Major Folders
@@ -48,11 +50,11 @@ npm with a committed `package-lock.json`.
 
 ## Tests and Verification
 
-Node test suites cover PHI detection and build/auth guard behavior. Browser smoke covers desktop and mobile. The Fly container must also pass a live root-page health check.
+Node test suites cover PHI detection, OpenMed fallback state, and build/auth guard behavior. The built-browser proof verifies real pinned OpenMed inference on synthetic input and network privacy. Browser smoke covers desktop and mobile. The Fly container must also pass a live root-page health check.
 
 ## Likely Files For Current Task
 
-`Dockerfile`, `fly.toml`, `package.json`, `vite.config.ts`, `.gitignore`, `.dockerignore`, and deployment documentation.
+`src/lib/phi/openmed.ts`, `src/lib/phi/openmed-device.test.ts`, `scripts/openmed-browser-proof.mjs`, `Dockerfile`, `fly.toml`, `package.json`, `vite.config.ts`, `.gitignore`, `.dockerignore`, and deployment documentation.
 
 ## Unknowns
 

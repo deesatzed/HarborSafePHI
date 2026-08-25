@@ -1,6 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { dropAdministrativeNoise, prepareModelInput } from "./packet.ts";
+import {
+  canonicalizePayload,
+  dropAdministrativeNoise,
+  prepareModelInput,
+} from "./packet.ts";
 
 test("dropAdministrativeNoise removes page banners and SDOH blocks", () => {
   const text = [
@@ -29,4 +33,14 @@ test("prepareModelInput keeps head and tail when over the limit", () => {
   assert.match(packed, /PVC burden/);
   assert.match(packed, /omitted to preserve visit notes/);
   assert.ok(packed.length <= 400);
+});
+
+test("canonicalizePayload normalizes and bounds the exact transmitted text", () => {
+  const result = canonicalizePayload(`  Head\r\n${"x".repeat(240)}\r\nTail  `, 120);
+
+  assert.equal(result.text, result.text.replace(/\r/g, ""));
+  assert.ok(result.text.length <= 120);
+  assert.equal(result.characterCount, result.text.length);
+  assert.equal(result.truncated, true);
+  assert.match(result.text, /middle administrative pages omitted to preserve visit notes/);
 });

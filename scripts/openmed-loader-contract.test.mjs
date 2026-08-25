@@ -10,7 +10,7 @@ const packageLock = JSON.parse(
 test("OpenMed stays lazy-loaded and uses the pinned WebGPU/WASM attempt runner", () => {
   assert.match(
     source,
-    /runOpenMedAttempts\(\s*webGpuAvailable\(\),/,
+    /runOpenMedAttempts\(\s*preferredDevice === "wasm"\s*\?\s*false\s*:\s*webGpuAvailable\(\),/,
   );
   assert.match(source, /OPENMED_MODEL_REVISION\s*=\s*"[0-9a-f]{40}"/);
   assert.match(source, /revision:\s*OPENMED_MODEL_REVISION/);
@@ -18,8 +18,8 @@ test("OpenMed stays lazy-loaded and uses the pinned WebGPU/WASM attempt runner",
   assert.match(source, /device:\s*"wasm"/);
   assert.match(source, /productionOpenMedSession\.runInference/);
   assert.doesNotMatch(source, /import\s*\{\s*normalizeLabel/);
-  assert.doesNotMatch(source, /model_file_name\s*:/);
-  assert.doesNotMatch(source, /dtype\s*:/);
+  assert.match(source, /model_file_name:\s*"model"/);
+  assert.match(source, /dtype:\s*attempt\.variant/);
   assert.match(source, /await import\("openmed"\)/);
 });
 

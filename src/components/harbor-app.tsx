@@ -15,8 +15,7 @@ import { buildExport, downloadTextFile } from "@/lib/phi/export";
 import { extractDocumentText } from "@/lib/phi/extract-document";
 import { buildSamplePdf } from "@/lib/phi/extract-pdf";
 import { IntakeGeneration, orchestrateDocumentIntake } from "@/lib/phi/intake-orchestrator";
-import { prepareModelInput } from "@/lib/phi/packet";
-import { formatExtractorCompare } from "@/lib/phi/pdf-text";
+import { canonicalizePayload } from "@/lib/phi/packet";
 import { isOpenMedCached, scanWithOpenMed } from "@/lib/phi/openmed";
 import { redactText } from "@/lib/phi/redact";
 import {
@@ -37,10 +36,8 @@ import {
 } from "@/lib/phi/types";
 import {
   fetchOpenRouterModels,
-  readOpenRouterKey,
   readOpenRouterModel,
   summarizeWithOpenRouter,
-  writeOpenRouterKey,
   writeOpenRouterModel,
   type OpenRouterModel,
 } from "@/lib/openrouter";
@@ -75,7 +72,7 @@ async function reviewedRepresentation(
   return {
     sourceTextSha256: await sha256Hex(document.text),
     dateMode: snapshot.dateMode,
-    redactedText: snapshot.redacted,
+    redactedText: canonicalizePayload(snapshot.redacted).text,
     findings: snapshot.spans,
   };
 }
@@ -113,13 +110,15 @@ export function HarborApp() {
   const [approvedReviewKey, setApprovedReviewKey] = useState<string | null>(null);
   const [reviewKey, setReviewKey] = useState<string | null>(null);
   const [approvalBusy, setApprovalBusy] = useState(false);
-  const [apiKey, setApiKey] = useState(() => (typeof window === "undefined" ? "" : readOpenRouterKey()));
+  const [apiKey, setApiKey] = useState("");
   const [model, setModel] = useState(() => (typeof window === "undefined" ? "" : readOpenRouterModel()));
   const [catalog, setCatalog] = useState<OpenRouterModel[]>([]);
   const [catalogBusy, setCatalogBusy] = useState(false);
   const [catalogError, setCatalogError] = useState<string | null>(null);
 
-  const redacted = extracted ? redactText(extracted.text, spans, dateMode).redacted : "";
+  const rawRedacted = extracted ? redactText(extracted.text, spans, dateMode).redacted : "";
+  const canonicalPayload = canonicalizePayload(rawRedacted);
+  const redacted = canonicalPayload.text;
   const accepted = spans.filter((span) => span.accepted).length;
   const showKeyFields = mode === "complex" && !config?.configured;
   const approvalRef = useRef<ReviewApproval | null>(null);
@@ -381,12 +380,11 @@ export function HarborApp() {
         "Set OPENROUTER_API_KEY and OPENROUTER_MODEL on the server (including Fly secrets), or paste a key and model in Complex.",
       );
     }
-    writeOpenRouterKey(apiKey);
     writeOpenRouterModel(model);
     const textOut = await summarizeWithOpenRouter({
       apiKey,
       model,
-      redactedText: prepareModelInput(input.redactedText),
+      redactedText: input.redactedText,
     });
     if (!summaryIsCurrent(identity, token)) return null;
     return textOut;
@@ -485,23 +483,24 @@ export function HarborApp() {
       spans: context.snapshot.spans,
       dateMode: context.snapshot.dateMode,
       detectors,
+      redactedText: context.input.redactedText,
       report,
     });
-    const base = context.snapshot.extracted.fileName.replace(/\.(pdf|docx)$/i, "") + "-deidentified";
+    const base = payload.artifactId;
     downloadTextFile(`${base}.md`, payload.markdown, "text/markdown");
     downloadTextFile(`${base}.json`, JSON.stringify(payload.json, null, 2), "application/json");
   }
 
-  function downloadExtractorCompare() {
-    if (!extracted?.extractors?.length) return;
-    const base = extracted.fileName.replace(/\.pdf$/i, "") + "-extractors";
-    downloadTextFile(`${base}.txt`, formatExtractorCompare(extracted.extractors), "text/plain");
-  }
-
   async function copy(label: "report" | "clean", value: string) {
-    await navigator.clipboard.writeText(value);
-    setCopied(label);
-    window.setTimeout(() => setCopied(null), 1400);
+    try {
+      await navigator.clipboard.writeText(value);
+      setCopied(label);
+      window.setTimeout(() => setCopied(null), 1400);
+      return true;
+    } catch {
+      setReportError("Harbor could not copy that text. It remains available in the approved view.");
+      return false;
+    }
   }
 
   async function createReport() {
@@ -540,7 +539,8 @@ export function HarborApp() {
     );
     if (!context) return;
     const reviewSha256 = context.approval.reviewSha256;
-    await copy(label, value);
+    const copiedSuccessfully = await copy(label, value);
+    if (!copiedSuccessfully) return;
     if (
       approvalRef.current?.reviewSha256 !== reviewSha256 ||
       approvedReviewKeyRef.current !== reviewSha256 ||
@@ -737,7 +737,7 @@ export function HarborApp() {
                     </div>
                   </details>
                   {extracted.extractors?.length ? (
-                    <ExtractorCompare rows={extracted.extractors} onDownload={downloadExtractorCompare} />
+                    <ExtractorCompare rows={extracted.extractors} />
                   ) : null}
                 </>
               ) : null}
@@ -750,6 +750,9 @@ export function HarborApp() {
                 report={report}
                 reportBusy={reportBusy}
                 reportError={reportError}
+                payloadCharacterCount={canonicalPayload.characterCount}
+                payloadSourceCharacterCount={canonicalPayload.sourceCharacterCount}
+                payloadTruncated={canonicalPayload.truncated}
                 copied={copied}
                 onApprove={() => void approveCurrentReview()}
                 onCreate={() => void createReport()}

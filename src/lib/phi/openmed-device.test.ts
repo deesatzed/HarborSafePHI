@@ -4,6 +4,7 @@ import {
   createOpenMedSession,
   OPENMED_MODEL,
   OPENMED_MODEL_REVISION,
+  openMedLoaderOptions,
   runOpenMedAttempts,
 } from "./openmed.ts";
 
@@ -15,6 +16,14 @@ function fakeEngine(pipeline: () => Promise<never[]> = async () => []) {
     model: OPENMED_MODEL,
     revision: OPENMED_MODEL_REVISION,
     normalizeLabel: () => "OTHER" as const,
+  };
+}
+
+function fakeEngineFor(device: "webgpu" | "wasm", pipeline: () => Promise<never[]> = async () => []) {
+  return {
+    ...fakeEngine(pipeline),
+    device,
+    variant: device === "webgpu" ? ("fp16" as const) : ("int8" as const),
   };
 }
 
@@ -63,6 +72,37 @@ test("no WebGPU tries WASM only", async () => {
 
   assert.deepEqual(seen, [{ device: "wasm", variant: "int8" }]);
   assert.equal(result.attempt.device, "wasm");
+});
+
+test("loader options map the logical variant to the pinned root model files", () => {
+  const progress = () => undefined;
+
+  assert.deepEqual(
+    openMedLoaderOptions({ device: "webgpu", variant: "fp16" }, progress),
+    {
+      variant: "fp16",
+      dtype: "fp16",
+      device: "webgpu",
+      pipelineOptions: {
+        progress_callback: progress,
+        model_file_name: "model",
+        subfolder: "",
+      },
+    },
+  );
+  assert.deepEqual(
+    openMedLoaderOptions({ device: "wasm", variant: "int8" }, progress),
+    {
+      variant: "int8",
+      dtype: "int8",
+      device: "wasm",
+      pipelineOptions: {
+        progress_callback: progress,
+        model_file_name: "model",
+        subfolder: "",
+      },
+    },
+  );
 });
 
 test("both failures reject with the final failure", async () => {
@@ -158,6 +198,28 @@ test("pipeline failure downgrades runtime and discards the unusable engine", asy
   });
   await session.load();
   assert.equal(initializationCalls, 2);
+});
+
+test("WebGPU inference failure retries the operation on WASM", async () => {
+  let initializationCalls = 0;
+  const seenDevices: string[] = [];
+  const session = createOpenMedSession(async (_onProgress, preferredDevice) => {
+    initializationCalls += 1;
+    const device = preferredDevice ?? (initializationCalls === 1 ? "webgpu" : "wasm");
+    return fakeEngineFor(device, async () => []);
+  });
+
+  const result = await session.runInference(async (loaded) => {
+    seenDevices.push(loaded.device);
+    if (loaded.device === "webgpu") throw new Error("f16 unsupported");
+    return loaded.pipeline("test");
+  });
+
+  assert.deepEqual(result, []);
+  assert.deepEqual(seenDevices, ["webgpu", "wasm"]);
+  assert.equal(initializationCalls, 2);
+  assert.equal(session.getRuntimeState().device, "wasm");
+  assert.equal(session.getRuntimeState().variant, "int8");
 });
 
 test("runtime becomes ready only after inference succeeds", async () => {

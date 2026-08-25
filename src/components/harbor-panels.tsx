@@ -12,7 +12,7 @@ import type { OpenRouterModel } from "@/lib/openrouter";
 import type { ReportConfig } from "@/lib/openrouter-env";
 import { describeOpenRouterDateDisclosure } from "@/lib/phi/review";
 
-export const DATE_MODES: { id: DateMode; label: string; hint: string }[] = [
+const DATE_MODES: { id: DateMode; label: string; hint: string }[] = [
   { id: "relative", label: "Relative", hint: "Day 0, Day +N" },
   { id: "year", label: "Year only", hint: "Safe Harbor year" },
   { id: "keep", label: "Keep dates", hint: "Leave dates in the extract. Reports already keep clinical dates." },
@@ -143,13 +143,7 @@ export function FindingsList({
   );
 }
 
-export function ExtractorCompare({
-  rows,
-  onDownload,
-}: {
-  rows: ExtractorSnapshot[];
-  onDownload: () => void;
-}) {
+export function ExtractorCompare({ rows }: { rows: ExtractorSnapshot[] }) {
   if (rows.length === 0) return null;
   const used = rows.find((row) => row.id === "layout");
   return (
@@ -185,13 +179,9 @@ export function ExtractorCompare({
         </ul>
         <p className="text-xs leading-relaxed text-muted">
           aA glue counts lowercase-then-uppercase joins (OftenWordGlue). a1 glue counts letter-digit joins. Lower
-          is usually cleaner; lab tokens like HbA1c still increment both. The download is the original PDF text, not
-          the redacted view.
+          is usually cleaner; lab tokens like HbA1c still increment both. Comparison text stays in this tab and is
+          never included in a Harbor artifact.
         </p>
-        <Button variant="secondary" size="sm" onClick={onDownload}>
-          <Download className="size-4" />
-          Download four original extracts
-        </Button>
       </div>
     </details>
   );
@@ -206,6 +196,9 @@ export function ReportPanel({
   report,
   reportBusy,
   reportError,
+  payloadCharacterCount,
+  payloadSourceCharacterCount,
+  payloadTruncated,
   copied,
   onApprove,
   onCreate,
@@ -229,6 +222,9 @@ export function ReportPanel({
   report: string | null;
   reportBusy: boolean;
   reportError: string | null;
+  payloadCharacterCount: number;
+  payloadSourceCharacterCount: number;
+  payloadTruncated: boolean;
   copied: string | null;
   onApprove: () => void;
   onCreate: () => void;
@@ -279,6 +275,11 @@ export function ReportPanel({
 
       <p data-testid="summary-date-disclosure" className="text-xs leading-relaxed text-muted">
         {describeOpenRouterDateDisclosure(dateMode)}
+      </p>
+      <p data-testid="payload-disclosure" className="text-xs leading-relaxed text-muted">
+        {payloadTruncated
+          ? `Canonical payload: ${payloadCharacterCount} characters, bounded from ${payloadSourceCharacterCount}. This exact text is used after approval.`
+          : `Canonical payload: ${payloadCharacterCount} characters. This exact text is used after approval.`}
       </p>
 
       {showKeyFields ? (

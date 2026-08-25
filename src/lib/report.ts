@@ -4,12 +4,12 @@ import { readFileSync } from "node:fs";
 import { parseDotEnv, reportConfigFromEnv, serverOpenRouterFromEnv } from "@/lib/openrouter-env";
 import {
   extractOpenRouterText,
+  openRouterNetworkError,
   parseOpenRouterError,
   REPORT_USER_PREFIX,
   SYSTEM_PROMPT,
   type OpenRouterChatJson,
 } from "@/lib/openrouter";
-import { prepareModelInput } from "@/lib/phi/packet";
 import {
   validateApprovedReportInput,
   type ApprovedReportInput,
@@ -61,38 +61,46 @@ export const generateServerReport = createServerFn({ method: "POST" })
     const requested = approvedInput.model?.trim() ?? "";
     const model =
       requested && parsed.models.includes(requested) ? requested : parsed.model;
-    const redactedText = approvedInput.redactedText.trim();
+    const redactedText = approvedInput.redactedText;
     if (redactedText.length < 20) {
       return { ok: false as const, error: "The de-identified text is too short to report." };
     }
-    const res = await fetch("https://openrouter.ai/api/v1/chat/completions", {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${parsed.key}`,
-        "Content-Type": "application/json",
-        "X-Title": "Harbor",
-      },
-      body: JSON.stringify({
-        model,
-        max_tokens: 16384,
-        temperature: 0.2,
-        messages: [
-          { role: "system", content: SYSTEM_PROMPT },
-          {
-            role: "user",
-            content: REPORT_USER_PREFIX + prepareModelInput(redactedText),
-          },
-        ],
-      }),
-    });
+    let res: Response;
+    try {
+      res = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${parsed.key}`,
+          "Content-Type": "application/json",
+          "X-Title": "Harbor",
+        },
+        body: JSON.stringify({
+          model,
+          max_tokens: 16384,
+          temperature: 0.2,
+          messages: [
+            { role: "system", content: SYSTEM_PROMPT },
+            {
+              role: "user",
+              content: REPORT_USER_PREFIX + redactedText,
+            },
+          ],
+        }),
+      });
+    } catch {
+      return { ok: false as const, error: openRouterNetworkError() };
+    }
     if (!res.ok) {
-      const body = await res.text();
-      return { ok: false as const, error: parseOpenRouterError(res.status, body) };
+      return { ok: false as const, error: parseOpenRouterError(res.status) };
     }
-    const json = (await res.json()) as OpenRouterChatJson;
-    const extracted = extractOpenRouterText(json);
-    if (!extracted.text) {
-      return { ok: false as const, error: extracted.detail };
+    try {
+      const json = (await res.json()) as OpenRouterChatJson;
+      const extracted = extractOpenRouterText(json);
+      if (!extracted.text) {
+        return { ok: false as const, error: extracted.detail };
+      }
+      return { ok: true as const, text: extracted.text, model };
+    } catch {
+      return { ok: false as const, error: "Harbor received an unreadable OpenRouter response. Try again." };
     }
-    return { ok: true as const, text: extracted.text, model };
   });

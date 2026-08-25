@@ -1,19 +1,9 @@
-const KEY_STORAGE = "harbor.openrouter.key";
 const MODEL_STORAGE = "harbor.openrouter.model";
 
 export type OpenRouterModel = {
   id: string;
   name: string;
 };
-
-export function readOpenRouterKey(): string {
-  if (typeof localStorage === "undefined") return "";
-  return localStorage.getItem(KEY_STORAGE) ?? "";
-}
-
-export function writeOpenRouterKey(key: string) {
-  localStorage.setItem(KEY_STORAGE, key.trim());
-}
 
 export function readOpenRouterModel(): string {
   if (typeof localStorage === "undefined") return "";
@@ -25,29 +15,32 @@ export function writeOpenRouterModel(model: string) {
 }
 
 export async function fetchOpenRouterModels(): Promise<OpenRouterModel[]> {
-  const res = await fetch("https://openrouter.ai/api/v1/models");
-  if (!res.ok) {
-    throw new Error(`OpenRouter model catalog returned ${res.status}. Paste a model id.`);
+  try {
+    const res = await fetch("https://openrouter.ai/api/v1/models");
+    if (!res.ok) throw new Error(parseOpenRouterError(res.status));
+    const json = (await res.json()) as {
+      data?: {
+        id: string;
+        name?: string;
+        architecture?: { modality?: string; input_modalities?: string[] };
+      }[];
+    };
+    const models = (json.data ?? [])
+      .filter((model) => {
+        const inputs = model.architecture?.input_modalities ?? [];
+        if (inputs.length > 0) return inputs.includes("text");
+        return (model.architecture?.modality ?? "text").includes("text");
+      })
+      .map((model) => ({ id: model.id, name: model.name ?? model.id }))
+      .sort((a, b) => a.name.localeCompare(b.name));
+    if (models.length === 0) {
+      throw new Error("Harbor found no text models in the provider catalog.");
+    }
+    return models;
+  } catch (error) {
+    if (error instanceof Error && error.message.startsWith("Harbor ")) throw error;
+    throw new Error(openRouterNetworkError());
   }
-  const json = (await res.json()) as {
-    data?: {
-      id: string;
-      name?: string;
-      architecture?: { modality?: string; input_modalities?: string[] };
-    }[];
-  };
-  const models = (json.data ?? [])
-    .filter((model) => {
-      const inputs = model.architecture?.input_modalities ?? [];
-      if (inputs.length > 0) return inputs.includes("text");
-      return (model.architecture?.modality ?? "text").includes("text");
-    })
-    .map((model) => ({ id: model.id, name: model.name ?? model.id }))
-    .sort((a, b) => a.name.localeCompare(b.name));
-  if (models.length === 0) {
-    throw new Error("OpenRouter returned no text models. Paste a model id.");
-  }
-  return models;
 }
 
 export const SYSTEM_PROMPT = `The supplied report is a de-identified Epic/MyChart export. Keep tokens such as [NAME], [ADDRESS], [DOB], [PHONE], [ORG], and [ID] as tokens. Do not reconstruct identity. "Active Problems" may be empty even when notes, results, and medication lists document treated conditions; prefer those over an empty problem list. If the source uses relative dates (Day 0, Day +N) or year-only dates, keep those tokens exactly.
@@ -117,16 +110,23 @@ export function extractOpenRouterText(json: OpenRouterChatJson): { text: string;
   if (fromContent) return { text: fromContent, detail: "content" };
   if (choice?.text?.trim()) return { text: choice.text.trim(), detail: "text" };
   const finish = choice?.finish_reason || choice?.native_finish_reason || "unknown";
-  if (message?.refusal) return { text: "", detail: `OpenRouter refused: ${message.refusal}` };
-  if (json.error?.message) return { text: "", detail: json.error.message };
+  if (message?.refusal) {
+    return { text: "", detail: "Harbor could not create a summary because the provider refused the request." };
+  }
+  if (json.error?.message) {
+    return { text: "", detail: "Harbor could not create a summary because the provider returned an error." };
+  }
   const hadReasoning = Boolean((message?.reasoning || message?.reasoning_content || "").trim());
   if (hadReasoning) {
     return {
       text: "",
-      detail: `OpenRouter returned no report text (finish_reason=${finish}; the model only emitted reasoning). Try again or pick a non-reasoning model id.`,
+      detail: `Harbor received no report text (finish_reason=${safeFinishReason(finish)}; the model only emitted reasoning). Try again or pick another model id.`,
     };
   }
-  return { text: "", detail: `OpenRouter returned no report text (finish_reason=${finish}).` };
+  return {
+    text: "",
+    detail: `Harbor received no report text (finish_reason=${safeFinishReason(finish)}). Try again or pick another model id.`,
+  };
 }
 
 export async function summarizeWithOpenRouter(args: {
@@ -135,50 +135,57 @@ export async function summarizeWithOpenRouter(args: {
   redactedText: string;
 }): Promise<string> {
   const model = args.model.trim();
-  if (!model) throw new Error("Choose an OpenRouter model id before sending.");
-  const res = await fetch("https://openrouter.ai/api/v1/chat/completions", {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${args.apiKey}`,
-      "Content-Type": "application/json",
-      "HTTP-Referer": typeof window === "undefined" ? "https://harbor.local" : window.location.origin,
-      "X-Title": "Harbor",
-    },
-    body: JSON.stringify({
-      model,
-      max_tokens: 16384,
-      temperature: 0.2,
-      messages: [
-        { role: "system", content: SYSTEM_PROMPT },
-        {
-          role: "user",
-          content:
-            REPORT_USER_PREFIX + args.redactedText,
-        },
-      ],
-    }),
-  });
+  if (!model) throw new Error("Harbor needs an OpenRouter model id before sending.");
+  try {
+    const res = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${args.apiKey}`,
+        "Content-Type": "application/json",
+        "HTTP-Referer": typeof window === "undefined" ? "https://harbor.local" : window.location.origin,
+        "X-Title": "Harbor",
+      },
+      body: JSON.stringify({
+        model,
+        max_tokens: 16384,
+        temperature: 0.2,
+        messages: [
+          { role: "system", content: SYSTEM_PROMPT },
+          {
+            role: "user",
+            content: REPORT_USER_PREFIX + args.redactedText,
+          },
+        ],
+      }),
+    });
 
-  if (!res.ok) {
-    const body = await res.text();
-    throw new Error(parseOpenRouterError(res.status, body));
+    if (!res.ok) throw new Error(parseOpenRouterError(res.status));
+    const json = (await res.json()) as OpenRouterChatJson;
+    const extracted = extractOpenRouterText(json);
+    if (!extracted.text) throw new Error(extracted.detail);
+    return extracted.text;
+  } catch (error) {
+    if (error instanceof Error && error.message.startsWith("Harbor ")) throw error;
+    throw new Error(openRouterNetworkError());
   }
-
-  const json = (await res.json()) as OpenRouterChatJson;
-  const extracted = extractOpenRouterText(json);
-  if (!extracted.text) throw new Error(extracted.detail);
-  return extracted.text;
 }
 
-export function parseOpenRouterError(status: number, body: string): string {
-  if (status === 401) return "OpenRouter rejected the API key.";
-  if (status === 402) return "OpenRouter says this key is out of credits.";
-  if (status === 429) return "OpenRouter rate-limited the request. Try again in a moment.";
-  try {
-    const json = JSON.parse(body) as { error?: { message?: string } };
-    if (json.error?.message) return json.error.message;
-  } catch {
-    /* ignore */
-  }
-  return `OpenRouter error ${status}`;
+export function openRouterNetworkError(): string {
+  return "Harbor could not reach OpenRouter. Check your connection and try again.";
+}
+
+export function parseOpenRouterError(status: number, _body?: string): string {
+  if (status === 401) return "Harbor OpenRouter key was rejected.";
+  if (status === 402) return "Harbor OpenRouter key has no available credits.";
+  if (status === 403) return "Harbor OpenRouter request was not allowed.";
+  if (status === 404) return "Harbor could not find the selected OpenRouter model.";
+  if (status === 408) return "Harbor's OpenRouter request timed out. Try again.";
+  if (status === 413) return "Harbor's approved payload is too large for OpenRouter.";
+  if (status === 429) return "Harbor was rate-limited by OpenRouter. Try again in a moment.";
+  if (status >= 500) return "Harbor OpenRouter service is temporarily unavailable. Try again.";
+  return "Harbor could not complete the OpenRouter request.";
+}
+
+function safeFinishReason(value: string): string {
+  return ["stop", "length", "content_filter", "tool_calls"].includes(value) ? value : "unknown";
 }

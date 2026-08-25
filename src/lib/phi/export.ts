@@ -1,11 +1,13 @@
 import { countByCategory } from "./detect.ts";
+import { canonicalizePayload } from "./packet.ts";
 import { redactText } from "./redact.ts";
 import type { DateMode, ExtractedDocument, PhiSpan } from "./types.ts";
 
 export type HarborExport = {
   schema: "harbor-clinical-extract-v1";
+  artifactId: string;
   generatedAt: string;
-  source: { fileName: string; pageCount: number | null };
+  source: { pageCount: number | null };
   deid: {
     method: "safe_harbor_plus_review";
     dateMode: DateMode;
@@ -23,15 +25,19 @@ export function buildExport(args: {
   spans: PhiSpan[];
   dateMode: DateMode;
   detectors: string[];
+  redactedText: string;
+  artifactId?: string;
   report?: string | null;
-}): { json: HarborExport; markdown: string; redacted: string } {
+}): { artifactId: string; json: HarborExport; markdown: string; redacted: string } {
   const redaction = redactText(args.extracted.text, args.spans, args.dateMode);
+  const canonical = canonicalizePayload(args.redactedText);
+  const artifactId = safeArtifactId(args.artifactId);
   const findings = countByCategory(args.spans);
   const json: HarborExport = {
     schema: "harbor-clinical-extract-v1",
+    artifactId,
     generatedAt: new Date().toISOString(),
     source: {
-      fileName: args.extracted.fileName,
       pageCount: args.extracted.pageCount,
     },
     deid: {
@@ -47,7 +53,7 @@ export function buildExport(args: {
       total: row.total,
       accepted: row.accepted,
     })),
-    text: redaction.redacted,
+    text: canonical.text,
   };
 
   const markdown = [
@@ -56,7 +62,7 @@ export function buildExport(args: {
       : []),
     `# De-identified clinical extract`,
     ``,
-    `Source file: ${args.extracted.fileName} · Pages: ${
+    `Artifact ID: ${artifactId} · Pages: ${
       args.extracted.pageCount === null ? "Unknown" : args.extracted.pageCount
     }`,
     `Date mode: ${args.dateMode}${redaction.originIso ? ` · index ${redaction.originIso}` : ""}`,
@@ -65,11 +71,20 @@ export function buildExport(args: {
     ``,
     `## De-identified extract`,
     ``,
-    redaction.redacted.trim(),
+    canonical.text,
     ``,
   ].join("\n");
 
-  return { json, markdown, redacted: redaction.redacted };
+  return { artifactId, json, markdown, redacted: canonical.text };
+}
+
+function safeArtifactId(input?: string): string {
+  const supplied = input?.trim().replace(/[^A-Za-z0-9-]+/g, "-").replace(/^-+|-+$/g, "");
+  if (supplied?.startsWith("artifact-") && supplied.length > "artifact-".length) return supplied;
+  if (supplied) return `artifact-${supplied}`;
+  const uuid = globalThis.crypto?.randomUUID?.();
+  if (uuid) return `artifact-${uuid}`;
+  return `artifact-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
 }
 
 export function downloadTextFile(filename: string, contents: string, mime: string) {

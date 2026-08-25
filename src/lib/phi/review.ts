@@ -1,4 +1,10 @@
 import type { DateMode, DetectorSource, PhiCategory } from "./types.ts";
+import { canonicalizePayload } from "./packet.ts";
+
+export const MAX_REVIEW_SOURCE_CHARACTERS = 2_000_000;
+export const MAX_REVIEW_FINDINGS = 10_000;
+const MAX_REVIEW_HASH_LENGTH = 128;
+const MAX_FINDING_FIELD_LENGTH = 64;
 
 export type ReviewedFinding = {
   start: number;
@@ -57,16 +63,58 @@ function canonicalFindings(findings: readonly ReviewedFinding[]) {
     );
 }
 
+function canonicalReviewInput(input: ReviewedRepresentation): ReviewedRepresentation {
+  if (!input || typeof input.sourceTextSha256 !== "string") {
+    throw new Error("Missing source-text fingerprint.");
+  }
+  if (input.sourceTextSha256.length > MAX_REVIEW_HASH_LENGTH) {
+    throw new Error("Source-text fingerprint is too long.");
+  }
+  if (!isDateMode(input.dateMode)) {
+    throw new Error("Invalid date mode.");
+  }
+  if (typeof input.redactedText !== "string") {
+    throw new Error("Missing de-identified text.");
+  }
+  if (input.redactedText.length > MAX_REVIEW_SOURCE_CHARACTERS) {
+    throw new Error("The redacted text exceeds Harbor's local review limit.");
+  }
+  if (!Array.isArray(input.findings) || input.findings.length > MAX_REVIEW_FINDINGS) {
+    throw new Error("The review contains too many findings.");
+  }
+  for (const finding of input.findings) {
+    if (
+      !Number.isInteger(finding.start) ||
+      !Number.isInteger(finding.end) ||
+      finding.start < 0 ||
+      finding.end < finding.start ||
+      finding.end > MAX_REVIEW_SOURCE_CHARACTERS ||
+      typeof finding.category !== "string" ||
+      finding.category.length > MAX_FINDING_FIELD_LENGTH ||
+      typeof finding.source !== "string" ||
+      finding.source.length > MAX_FINDING_FIELD_LENGTH ||
+      typeof finding.accepted !== "boolean"
+    ) {
+      throw new Error("The review contains an invalid finding.");
+    }
+  }
+  return {
+    ...input,
+    redactedText: canonicalizePayload(input.redactedText).text,
+  };
+}
+
 export async function reviewFingerprint(
   input: ReviewedRepresentation,
 ): Promise<string> {
-  const redactedSha256 = await sha256Hex(input.redactedText);
+  const canonical = canonicalReviewInput(input);
+  const redactedSha256 = await sha256Hex(canonical.redactedText);
   return sha256Hex(
     JSON.stringify({
-      sourceTextSha256: input.sourceTextSha256,
-      dateMode: input.dateMode,
+      sourceTextSha256: canonical.sourceTextSha256,
+      dateMode: canonical.dateMode,
       redactedSha256,
-      findings: canonicalFindings(input.findings),
+      findings: canonicalFindings(canonical.findings),
     }),
   );
 }
@@ -75,13 +123,14 @@ export async function approveReview(
   input: ReviewedRepresentation,
   now = new Date(),
 ): Promise<ReviewApproval> {
+  const canonical = canonicalReviewInput(input);
   const [redactedSha256, reviewSha256] = await Promise.all([
-    sha256Hex(input.redactedText),
-    reviewFingerprint(input),
+    sha256Hex(canonical.redactedText),
+    reviewFingerprint(canonical),
   ]);
   return {
     approvedAt: now.toISOString(),
-    dateMode: input.dateMode,
+    dateMode: canonical.dateMode,
     redactedSha256,
     reviewSha256,
   };
@@ -91,10 +140,12 @@ export async function reviewIsCurrent(
   approval: ReviewApproval | null,
   input: ReviewedRepresentation,
 ): Promise<boolean> {
-  if (!approval || approval.dateMode !== input.dateMode) return false;
+  if (!approval) return false;
+  const canonical = canonicalReviewInput(input);
+  if (approval.dateMode !== canonical.dateMode) return false;
   const [redactedSha256, reviewSha256] = await Promise.all([
-    sha256Hex(input.redactedText),
-    reviewFingerprint(input),
+    sha256Hex(canonical.redactedText),
+    reviewFingerprint(canonical),
   ]);
   return (
     approval.redactedSha256 === redactedSha256 &&
@@ -112,17 +163,24 @@ export async function validateApprovedReportInput(
   if (!input || typeof input.redactedText !== "string") {
     throw new Error("Missing de-identified text.");
   }
+  if (input.redactedText.length > MAX_REVIEW_SOURCE_CHARACTERS) {
+    throw new Error("The approved redacted text exceeds Harbor's local review limit.");
+  }
   if (typeof input.redactedSha256 !== "string") {
     throw new Error("Missing approved redacted-text fingerprint.");
   }
   if (!isDateMode(input.dateMode)) {
     throw new Error("Invalid date mode.");
   }
-  if ((await sha256Hex(input.redactedText)) !== input.redactedSha256) {
+  const canonical = canonicalizePayload(input.redactedText);
+  if (canonical.text !== input.redactedText) {
+    throw new Error("Approved payload is not canonical.");
+  }
+  if ((await sha256Hex(canonical.text)) !== input.redactedSha256) {
     throw new Error("Approved redacted-text fingerprint mismatch.");
   }
   return {
-    redactedText: input.redactedText,
+    redactedText: canonical.text,
     redactedSha256: input.redactedSha256,
     dateMode: input.dateMode,
     ...(typeof input.model === "string" ? { model: input.model } : {}),

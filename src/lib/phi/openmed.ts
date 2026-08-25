@@ -36,7 +36,24 @@ export type OpenMedEngine = {
 
 export type OpenMedInitializer = (
   onProgress: (message: string) => void,
+  preferredDevice?: OpenMedDevice,
 ) => Promise<OpenMedEngine>;
+
+export function openMedLoaderOptions(
+  attempt: OpenMedAttempt,
+  progress: (info: HubProgress) => void,
+) {
+  return {
+    variant: attempt.variant,
+    dtype: attempt.variant,
+    device: attempt.device,
+    pipelineOptions: {
+      progress_callback: progress,
+      model_file_name: "model",
+      subfolder: "",
+    },
+  };
+}
 
 export function openMedAttempts(hasWebGpu: boolean): OpenMedAttempt[] {
   return hasWebGpu
@@ -105,6 +122,7 @@ export function createOpenMedSession(initialize: OpenMedInitializer) {
 
   const load = async (
     onProgress?: (message: string) => void,
+    preferredDevice?: OpenMedDevice,
   ): Promise<OpenMedEngine> => {
     if (engine) {
       notify(
@@ -124,7 +142,7 @@ export function createOpenMedSession(initialize: OpenMedInitializer) {
 
       loading = (async () => {
         try {
-          const loaded = await initialize(report);
+          const loaded = await initialize(report, preferredDevice);
           engine = loaded;
           return loaded;
         } catch (error) {
@@ -152,23 +170,46 @@ export function createOpenMedSession(initialize: OpenMedInitializer) {
   ): Promise<T> => {
     const generation = ++inferenceGeneration;
     const loaded = await load(onProgress);
-    try {
-      const result = await operation(loaded);
-      if (generation === inferenceGeneration && engine === loaded) {
+    const execute = async (active: OpenMedEngine): Promise<T> => {
+      const result = await operation(active);
+      if (generation === inferenceGeneration && engine === active) {
         runtime = {
           status: "ready",
-          device: loaded.device,
-          variant: loaded.variant,
-          model: loaded.model,
-          revision: loaded.revision,
+          device: active.device,
+          variant: active.variant,
+          model: active.model,
+          revision: active.revision,
         };
       }
       notify(
         onProgress,
-        `OpenMed scan complete on ${loaded.device === "webgpu" ? "WebGPU" : "WASM"}.`,
+        `OpenMed scan complete on ${active.device === "webgpu" ? "WebGPU" : "WASM"}.`,
       );
       return result;
+    };
+
+    try {
+      return await execute(loaded);
     } catch (error) {
+      if (loaded.device === "webgpu" && generation === inferenceGeneration) {
+        if (engine === loaded) engine = null;
+        runtime = degradedRuntime();
+        notify(onProgress, "WebGPU inference failed. Trying OpenMed on WASM…");
+        try {
+          const fallback = await load(onProgress, "wasm");
+          if (fallback.device !== "wasm") {
+            throw new Error("OpenMed WASM fallback did not select the WASM device.");
+          }
+          return await execute(fallback);
+        } catch (fallbackError) {
+          if (generation === inferenceGeneration) {
+            if (engine?.device === "wasm") engine = null;
+            runtime = degradedRuntime();
+          }
+          notify(onProgress, DEGRADED_MESSAGE);
+          throw fallbackError instanceof Error ? fallbackError : new Error("OpenMed WASM inference failed");
+        }
+      }
       if (generation === inferenceGeneration) {
         if (engine === loaded) engine = null;
         runtime = degradedRuntime();
@@ -298,6 +339,7 @@ async function configureHub(onProgress: (message: string) => void) {
 
 async function initializeOpenMed(
   onProgress: (message: string) => void,
+  preferredDevice?: OpenMedDevice,
 ): Promise<OpenMedEngine> {
   const cached = await isOpenMedCached();
   onProgress(
@@ -319,8 +361,7 @@ async function initializeOpenMed(
           : "Downloading the WASM OpenMed weights…",
     );
     const pipeline = await openmed.loadOnnxModel(OPENMED_MODEL, {
-      variant: attempt.variant,
-      device: attempt.device,
+      ...openMedLoaderOptions(attempt, progress),
       revision: OPENMED_MODEL_REVISION,
       allowRemoteModels: true,
       localFilesOnly: false,
@@ -328,10 +369,6 @@ async function initializeOpenMed(
         pipeline: ((task, model, options) =>
           transformers.pipeline(task, model, options)) as TransformersRuntime["pipeline"],
         env: transformers.env,
-      },
-      pipelineOptions: {
-        progress_callback: progress,
-        subfolder: "",
       },
     });
     return {
@@ -345,7 +382,7 @@ async function initializeOpenMed(
   };
 
   const loaded = await runOpenMedAttempts(
-    webGpuAvailable(),
+    preferredDevice === "wasm" ? false : webGpuAvailable(),
     tryLoad,
     onProgress,
   );

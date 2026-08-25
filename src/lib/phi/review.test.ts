@@ -8,6 +8,7 @@ import {
   sha256Hex,
   validateApprovedReportInput,
 } from "./review.ts";
+import { canonicalizePayload } from "./packet.ts";
 
 const reviewed = {
   sourceTextSha256: "source-hash",
@@ -92,6 +93,42 @@ test("review canonicalization sorts findings and excludes original surfaces", as
   );
 });
 
+test("review fingerprints canonical payload text, not a later prepared variant", async () => {
+  const noncanonical = {
+    ...reviewed,
+    redactedText: `  ${reviewed.redactedText}\r\n`,
+  };
+  const canonical = {
+    ...noncanonical,
+    redactedText: canonicalizePayload(noncanonical.redactedText).text,
+  };
+
+  assert.equal(await reviewFingerprint(noncanonical), await reviewFingerprint(canonical));
+});
+
+test("approval hash equals the displayed and transmitted canonical payload hash", async () => {
+  const input = {
+    ...reviewed,
+    redactedText: "  [NAME] visited\r\n",
+  };
+  const canonical = canonicalizePayload(input.redactedText).text;
+  const approval = await approveReview(input, new Date("2026-08-24T12:00:00Z"));
+
+  assert.equal(approval.redactedSha256, await sha256Hex(canonical));
+  assert.deepEqual(
+    await validateApprovedReportInput({
+      redactedText: canonical,
+      redactedSha256: approval.redactedSha256,
+      dateMode: input.dateMode,
+    }),
+    {
+      redactedText: canonical,
+      redactedSha256: approval.redactedSha256,
+      dateMode: input.dateMode,
+    },
+  );
+});
+
 test("server report validation rejects a redacted-text fingerprint mismatch", async () => {
   const redactedText = "[NAME] visited on Day 0 for follow-up.";
   const valid = {
@@ -109,6 +146,21 @@ test("server report validation rejects a redacted-text fingerprint mismatch", as
   await assert.rejects(
     validateApprovedReportInput({ ...valid, dateMode: "invalid" as "relative" }),
     /date mode/i,
+  );
+});
+
+test("server report validation rejects a noncanonical approved payload", async () => {
+  const redactedText = "[NAME] visited on Day 0 for follow-up.";
+  const canonical = canonicalizePayload(redactedText).text;
+  const valid = {
+    redactedText: canonical,
+    redactedSha256: await sha256Hex(canonical),
+    dateMode: "relative" as const,
+  };
+
+  await assert.rejects(
+    validateApprovedReportInput({ ...valid, redactedText: ` ${canonical} ` }),
+    /canonical/i,
   );
 });
 
