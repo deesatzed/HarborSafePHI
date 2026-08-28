@@ -80,3 +80,70 @@ test("keep dates leaves the original date text", () => {
   const { redacted } = redactText(text, spans, "keep");
   assert.match(redacted, /03\/12\/2026/);
 });
+
+test("Safe Harbor labeled detectors cover fax, license, device, age 90+, and employer", () => {
+  const text = [
+    "Fax: (217) 555-0188",
+    "License: MD847291",
+    "Device ID: SN88201934A1",
+    "Age: 92",
+    "Employer: Acme Manufacturing",
+    "HbA1c 5.6",
+    "BP 128/78  HR 72",
+    "45 years old",
+    "89 years old",
+  ].join("\n");
+  const spans = detectLocalPhi(text, EMPTY_SEED);
+  const accepted = spans.filter((span) => span.accepted);
+  assert.ok(accepted.some((span) => span.category === "fax" && span.text.includes("555-0188")));
+  assert.ok(accepted.some((span) => span.category === "license" && span.text.includes("MD847291")));
+  assert.ok(accepted.some((span) => span.category === "device" && span.text.includes("SN88201934A1")));
+  assert.ok(accepted.some((span) => span.category === "age" && span.text.includes("92")));
+  assert.ok(spans.some((span) => span.category === "org" && /Acme Manufacturing/.test(span.text)));
+  assert.equal(
+    accepted.some((span) => span.category === "age" && /45|89/.test(span.text)),
+    false,
+  );
+  const { redacted } = redactText(text, spans, "relative");
+  assert.doesNotMatch(redacted, /555-0188/);
+  assert.doesNotMatch(redacted, /MD847291/);
+  assert.doesNotMatch(redacted, /SN88201934A1/);
+  assert.doesNotMatch(redacted, /\b92\b/);
+  assert.match(redacted, /HbA1c 5\.6/);
+  assert.match(redacted, /BP 128\/78/);
+  assert.match(redacted, /45 years old/);
+  assert.match(redacted, /89 years old/);
+});
+
+test("age 90+ years-old phrasing is redacted and under-90 is kept", () => {
+  const text = "90-year-old female. Independent. 72 years old spouse.";
+  const spans = detectLocalPhi(text, EMPTY_SEED);
+  assert.ok(spans.some((span) => span.accepted && span.category === "age" && /90/.test(span.text)));
+  assert.equal(
+    spans.some((span) => span.category === "age" && /72/.test(span.text)),
+    false,
+  );
+  const { redacted } = redactText(text, spans, "relative");
+  assert.doesNotMatch(redacted, /90-year-old/);
+  assert.match(redacted, /72 years old/);
+});
+
+test("vehicle VIN and biometric IDs map onto existing device/other_id categories", () => {
+  const text = "VIN: 1HGCM82633A004352\nFingerprint ID: FP8820193411\nDNA test pending.";
+  const spans = detectLocalPhi(text, EMPTY_SEED);
+  assert.ok(spans.some((span) => span.accepted && span.category === "device" && span.text.includes("1HGCM82633A004352")));
+  assert.ok(spans.some((span) => span.accepted && span.category === "other_id" && span.text.includes("FP8820193411")));
+  assert.equal(
+    spans.some((span) => /DNA test/i.test(span.text)),
+    false,
+  );
+});
+
+test("unlabeled phone stays phone, not fax", () => {
+  const text = "Callback (217) 555-0142. Fax: (217) 555-0188";
+  const spans = detectLocalPhi(text, EMPTY_SEED);
+  const phone = spans.find((span) => span.text.includes("555-0142"));
+  const fax = spans.find((span) => span.text.includes("555-0188"));
+  assert.equal(phone?.category, "phone");
+  assert.equal(fax?.category, "fax");
+});
